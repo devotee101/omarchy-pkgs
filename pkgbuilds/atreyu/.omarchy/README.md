@@ -20,4 +20,4 @@ Dependencies, cited as `file: tool` in the upstream tree:
 
 Release tracking: `bin/sync-upstream` follows `omacom/atreyu` through `upstream.watch.github`, which reads published GitHub Releases, excludes drafts and prereleases, and matches exactly `vX.Y.Z`. A newer release updates `pkgver`, resets `pkgrel` to 1, downloads `archive/refs/tags/v{pkgver}.tar.gz` and updates `sha256sums`. `min_release_age: 24h` holds a fresh release for a day; `release_ring: fast` builds it to edge, rc and stable.
 
-The first release's archive digest must be entered by hand because the watch updates only newer versions. Keep this recipe in draft until upstream publishes its first Release and the placeholder checksum is replaced; tags alone are not visible to the watch, and a repository without a published Release makes scheduled sync fail.
+The first release's archive digest must be entered by hand because the watch updates only newer versions. Keep this recipe in draft until upstream publishes its first Release and the placeholder checksum is replaced; tags alone are not visible to the watch.
