@@ -48,7 +48,6 @@ options=('!strip' '!debug')
 
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Fill once the v0.1.0 tag exists; sync-upstream only updates newer versions.
-# curl -fsSL https://github.com/omacom/atreyu/archive/refs/tags/v0.1.0.tar.gz | sha256sum
 sha256sums=('FILL_FROM_RELEASE_ARCHIVE')
 
 package() {
