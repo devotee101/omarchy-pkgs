@@ -854,6 +854,10 @@ runs only trusted default-branch code; package builds and tests stay in the
 ordinary PR workflows. It may take a few minutes for GitHub to register and
 release all the runs.
 
+Planning and builds use trusted tooling from the current target branch, pinned
+to one commit for the whole run. The PR's original comparison base still defines
+which packages changed. Older PRs do not need a rebase just to acquire CI tools.
+
 The label stays effective for that PR while attached, including later commits;
 it does not vouch for the author's other PRs. Removing it stops further label
 approvals, but does not cancel runs already released. An explicit denouncement

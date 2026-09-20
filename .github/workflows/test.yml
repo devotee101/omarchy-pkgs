@@ -32,8 +32,8 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Test PR workflow approval
-        run: node --test tests/pr-workflow-approval.cjs
+      - name: Test PR workflows
+        run: node --test tests/pr-workflow-approval.cjs tests/pr-build-tooling.cjs
 
       # An Arch container for vercmp: version ordering has to be decided by
       # the same comparator pacman uses on users' machines.

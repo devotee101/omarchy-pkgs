@@ -32,30 +32,28 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
+      tooling_sha: ${{ steps.tooling.outputs.commit }}
       matrix: ${{ steps.list.outputs.matrix }}
       count: ${{ steps.gate.outputs.count }}
       trusted: ${{ steps.gate.outputs.trusted }}
       vouch_status: ${{ steps.vouch.outputs.status }}
       empty: ${{ steps.list.outputs.empty }}
     steps:
-      # Same rule as the build job: bin/build-matrix comes from base, the
-      # package directories from the PR head.
+      # base.sha can remain at the PR's old comparison base, before the CI
+      # tools existed. Resolve the current target branch for trusted tooling,
+      # then pin its exact commit for every build job in this run. Keep the
+      # PR's original base.sha for the diff so unrelated base updates do not
+      # enter its package plan.
       - uses: actions/checkout@v4
+        id: tooling
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.head.sha }}"
           git checkout "${{ github.event.pull_request.head.sha }}" -- pkgbuilds/
-          # Bootstrap: the PR that introduces this tooling has a base without
-          # it. Take the plan helper from the PR head in that one case; it
-          # runs on a hosted runner and only prints a plan.
-          if [[ ! -x bin/build-matrix ]]; then
-            git checkout "${{ github.event.pull_request.head.sha }}" -- bin/build-matrix helpers/
-            echo "::notice::base branch has no bin/build-matrix; using the PR's copy for planning"
-          fi
       - id: vouch
         if: github.event_name == 'pull_request'
         uses: mitchellh/vouch/action/check-user@f23dbb5e745334f97414ec70463ce7301071a661 # v1
@@ -141,14 +139,15 @@ jobs:
       matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
     steps:
       # Tooling from base: everything that executes on this droplet's host
-      # (bin/, helpers/, build/) comes from the base branch. Only the PR's
+      # (bin/, helpers/, build/) comes from the same base commit as planning,
+      # even if the target branch advances while runners start. Only the PR's
       # package directories are overlaid. A PR can therefore change what
       # gets built, never how the runner builds it. A PR that changes both
       # tooling and a package builds the package with the OLD tooling; land
       # the tooling first. workflow_dispatch has no PR and runs as checked out.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ needs.changes.outputs.tooling_sha }}
           persist-credentials: false
       - name: Overlay the PR's package directories onto base tooling
         if: github.event_name == 'pull_request'
