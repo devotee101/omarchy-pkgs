@@ -161,6 +161,7 @@ jobs:
       - name: Build ${{ matrix.package }} (${{ matrix.arch }}, ships to ${{ matrix.channels }})
         env:
           CONTAINER_ENGINE: docker
+          OMARCHY_PREBUILT_IMAGES: '1'
         run: bin/build --mirror edge --arch ${{ matrix.arch }} --package ${{ matrix.package }}
       # The artifact label carries the package directory's git tree hash so
       # the publish step can find the build for exactly the tree that merged.
