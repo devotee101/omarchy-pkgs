@@ -6,7 +6,7 @@ BUILD_ROOT=$(realpath "${BASH_SOURCE[0]%/*}/..")
 source "$BUILD_ROOT/helpers/paths.sh"
 
 usage() {
-  echo "Usage: bin/builder-image {key|build} [--arch x86_64|aarch64] [--mirror edge|rc|stable] [--tag IMAGE] [--fresh]"
+  echo "Usage: bin/builder-image {key|build|prepare} [--arch x86_64|aarch64] [--mirror edge|rc|stable] [--tag IMAGE] [--fresh]"
 }
 
 command=${1:-}
@@ -24,8 +24,8 @@ while (( $# )); do
 done
 require_valid_arch "$ARCH"
 validate_mirror "$MIRROR" || { echo "Invalid mirror: $MIRROR" >&2; exit 1; }
-case "$command" in key|build) ;; *) usage >&2; exit 1 ;; esac
-if [[ $command == key && ( -n $tag || $fresh == true ) ]]; then
+case "$command" in key|build|prepare) ;; *) usage >&2; exit 1 ;; esac
+if [[ $command != build && ( -n $tag || $fresh == true ) ]]; then
   usage >&2
   exit 1
 fi
@@ -47,6 +47,41 @@ source "$BUILD_ROOT/helpers/docker-helpers.sh"
 check_engine
 platform=$(get_platform_arg "$ARCH")
 tag=${tag:-omarchy-pkg-builder:latest-$ARCH-$MIRROR}
+
+if [[ $command == prepare ]]; then
+  # All diagnostics go to stderr; stdout is one immutable reference, suitable
+  # for every container in this build. Never use a registry's unqualified
+  # "latest", and never trust a local tag left over from a failed pull.
+  repository=${OMARCHY_BUILDER_IMAGE_REPOSITORY:-ghcr.io/omacom/omarchy-pkg-builder}
+  reference="$repository:$key"
+  echo "Looking for prepared builder: $reference" >&2
+  if "$CONTAINER_ENGINE" pull "$platform" "$reference" >&2; then
+    if metadata=$("$CONTAINER_ENGINE" image inspect "$reference"); then
+      expected_arch=${platform##*/}
+      if pinned=$(jq -er --arg key "$key" --arg arch "$expected_arch" --arg repository "$repository" '
+        .[0] | select(.Config.Labels["org.omarchy.builder.key"] == $key and
+                      .Architecture == $arch and .Os == "linux") |
+        first(.RepoDigests[] | select(startswith($repository + "@sha256:")) |
+              select(split("@sha256:")[1] | test("^[a-f0-9]{64}$")))
+      ' <<<"$metadata"); then
+        echo "Using prepared builder: $pinned" >&2
+        echo "$pinned"
+        exit 0
+      fi
+    fi
+    echo "Prepared builder metadata does not match this checkout; building locally." >&2
+  else
+    echo "No accessible matching builder; building this checkout's image locally." >&2
+  fi
+  build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR" >&2
+  # Pin the local fallback too, rather than running a mutable convenience tag.
+  image_id=$("$CONTAINER_ENGINE" image inspect "$tag" --format '{{.Id}}')
+  [[ $image_id =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Invalid local image ID" >&2; exit 1; }
+  echo "Using locally built environment: $image_id" >&2
+  echo "$image_id"
+  exit 0
+fi
+
 revision=$(git -C "$BUILD_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)
 args=("$platform" --build-arg "MIRROR=$MIRROR"
   --label "org.omarchy.builder.key=$key"

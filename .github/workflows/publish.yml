@@ -67,6 +67,8 @@ jobs:
     runs-on: [self-hosted, omarchy-builder]
     environment: publish
     timeout-minutes: 240
+    env:
+      OMARCHY_PREBUILT_IMAGES: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -141,8 +143,20 @@ jobs:
             exit 1
           fi
 
+      - name: Prepare publishing image
+        id: publish-image
+        env:
+          CONTAINER_ENGINE: docker
+        run: |
+          set -euo pipefail
+          if compgen -G "build-output/edge/*/*.pkg.tar.zst" >/dev/null; then
+            image=$(bin/builder-image prepare --arch x86_64 --mirror edge)
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish
         env:
+          PUBLISH_BUILDER_IMAGE: ${{ steps.publish-image.outputs.image }}
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
           RCLONE_CONFIG_R2_TYPE: s3
@@ -168,9 +182,6 @@ jobs:
             cat publish-record.json
             exit 0
           fi
-          docker image inspect omarchy-pkg-builder:latest-x86_64-edge >/dev/null 2>&1 \
-            || docker buildx build --load -t omarchy-pkg-builder:latest-x86_64-edge --build-arg MIRROR=edge build
-
           # Group the merge's files by the (channel, architecture) slot each
           # belongs to. A package's files live under build-output/edge/<built
           # arch>/ and are named <pkgname>-<ver>-<arch|any>.pkg.tar.zst; a
@@ -178,7 +189,7 @@ jobs:
           # on the artifact list rather than the name.
           # pkgbase is read inside the builder image: the Ubuntu host has no
           # bsdtar. One container call maps every file to its pkgbase.
-          docker run --rm -v "$PWD:/w:ro" -w /w omarchy-pkg-builder:latest-x86_64-edge bash -c '
+          docker run --rm -v "$PWD:/w:ro" -w /w "$PUBLISH_BUILDER_IMAGE" bash -c '
             for f in build-output/edge/*/*.pkg.tar.zst; do
               printf "%s %s\n" "$f" "$(bsdtar -xOf "$f" .PKGINFO | awk -F" = " "\$1==\"pkgbase\"{print \$2}")"
             done' > pkgbase.txt
@@ -215,7 +226,7 @@ jobs:
                 -e RCLONE_CONFIG_R2_TYPE -e RCLONE_CONFIG_R2_PROVIDER -e RCLONE_CONFIG_R2_ENDPOINT -e RCLONE_CONFIG_R2_NO_CHECK_BUCKET \
                 -e RCLONE_CONFIG_R2_ACCESS_KEY_ID -e RCLONE_CONFIG_R2_SECRET_ACCESS_KEY \
                 -v "$PWD:/w:ro" -w /w \
-                omarchy-pkg-builder:latest-x86_64-edge \
+                "$PUBLISH_BUILDER_IMAGE" \
                 bin/publish-artifact --remote R2:omarchy-pkgs --mirror "$mirror" --arch "$parch" $files; then
                 record_slot "$mirror" "$parch" published "$files"
               else

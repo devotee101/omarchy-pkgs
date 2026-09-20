@@ -861,8 +861,32 @@ creates the package private. In the `omacom/omarchy-pkg-builder` package
 settings, change visibility to **Public**, then rerun the failed refresh job.
 The workflow checks anonymous registry access before advancing the compatible
 tag, so fork PRs will not be directed to an image they cannot pull. Subsequent
-refreshes preserve that package visibility. This change only produces images;
-package jobs keep their existing behavior until image consumption is enabled.
+refreshes preserve that package visibility.
+
+PR builds and publishing set `OMARCHY_PREBUILT_IMAGES=1`. `bin/build` then
+pulls the compatible tag, verifies its input key and architecture, and uses
+its immutable registry digest throughout that invocation. Missing, private,
+unavailable, or mismatched images fall back to building from the checked-out
+inputs and pinning the resulting local image ID. Publishing uses the same
+selection for its Arch utilities, before signing credentials are supplied.
+The selected reference is printed in the job log. No default-branch checkout
+is substituted for the job's own build definition.
+
+Local builds retain their existing behavior unless this flag is set. An
+explicit `OMARCHY_SKIP_BUILDER_IMAGE=1` still takes precedence, including in
+isolation tests. `bin/builder-image prepare --arch x86_64 --mirror edge` can
+also be used directly; stdout is the immutable reference and diagnostics go
+to stderr. `OMARCHY_BUILDER_IMAGE_REPOSITORY` overrides the registry repository
+for local testing. Package containers still run `pacman -Syu` before installing
+dependencies, and installed package state remains isolated between builds.
+
+Roll out image production first, make the GHCR package public, and rerun its
+initial refresh. Then enable consumption and compare x86_64 and ARM job times.
+During a registry outage or before the first matching publication, source
+builds continue to work. Reverting the consumer integration restores the
+previous image construction in package builds and publishing; the daily image
+producer can remain enabled. Neither stage requires a DO controller deployment
+or a VM snapshot change.
 
 ## Version Management
 

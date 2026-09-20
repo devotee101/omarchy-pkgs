@@ -26,12 +26,16 @@ DRY_RUN=false
 #                                   that builds the image once with an external
 #                                   BuildKit cache can then fan out over many
 #                                   package jobs without each one rebuilding it.
+#   OMARCHY_PREBUILT_IMAGES=1      prefer a tested registry image matching this
+#                                   checkout's build inputs; otherwise build
+#                                   locally. SKIP_BUILDER_IMAGE takes precedence.
 #   OMARCHY_DEFER_RUNTIME_DEPS=true build the omarchy/omarchy-settings pair
 #                                   with --nodeps (see build/build.sh); only
 #                                   for a pipeline that verifies the install
 #                                   transaction afterwards.
 KEEP_BUILD_WORKSPACE=${OMARCHY_KEEP_BUILD_WORKSPACE:-0}
 SKIP_BUILDER_IMAGE=${OMARCHY_SKIP_BUILDER_IMAGE:-0}
+PREBUILT_IMAGES=${OMARCHY_PREBUILT_IMAGES:-0}
 DEFER_RUNTIME_DEPS=${OMARCHY_DEFER_RUNTIME_DEPS:-false}
 
 # Parse command line arguments
@@ -91,6 +95,7 @@ while [[ $# -gt 0 ]]; do
     echo "Environment (for CI and resumed builds; defaults keep today's behaviour):"
     echo "  OMARCHY_KEEP_BUILD_WORKSPACE=1   keep build-output and reuse packages already there"
     echo "  OMARCHY_SKIP_BUILDER_IMAGE=1     use the existing builder image instead of building it"
+    echo "  OMARCHY_PREBUILT_IMAGES=1        pull a matching tested image, or build locally if unavailable"
     echo "  OMARCHY_DEFER_RUNTIME_DEPS=true  build the omarchy pair with --nodeps (transaction verified later)"
     echo "  OMARCHY_PUBLISHED_REPO_URL=<url> channel to plan and resolve against when no local tree exists"
     echo "                                   (default https://pkgs.omarchy.org; empty disables the fallback)"
@@ -105,6 +110,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_valid_arch "$ARCH"
+
+if [[ $PREBUILT_IMAGES != 0 && $PREBUILT_IMAGES != 1 ]]; then
+  print_error "OMARCHY_PREBUILT_IMAGES must be 0 or 1"
+  exit 1
+fi
 
 if [[ $DEFER_RUNTIME_DEPS != "false" && $DEFER_RUNTIME_DEPS != "true" ]]; then
   print_error "OMARCHY_DEFER_RUNTIME_DEPS must be true or false"
@@ -224,6 +234,8 @@ if [[ $SKIP_BUILDER_IMAGE == "1" ]]; then
     exit 1
   fi
   print_info "Using prepared builder image: $IMAGE_TAG"
+elif [[ $PREBUILT_IMAGES == 1 ]]; then
+  IMAGE_TAG=$("$BUILD_ROOT/bin/builder-image" prepare --arch "$ARCH" --mirror "$MIRROR")
 else
   build_docker_image "$BUILD_DIR" "$ARCH" "$MIRROR"
 fi
