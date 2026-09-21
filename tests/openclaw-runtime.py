@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
+import signal
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +39,7 @@ raise AssertionError('mise exec would load project environment')
 '''
 
 RUNTIME = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, signal, sys, time
 home = pathlib.Path(os.environ['HOME'])
 args = [pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]
 with open(home / 'calls', 'a') as log:
@@ -65,6 +67,33 @@ if args[2:] == ['--version']:
         sys.exit(29)
     print(version)
 else:
+    if os.environ.get('CREATE_SERVICE'):
+        unit_dir = home / '.config/systemd/user'
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        service = 'openclaw-' + os.environ['CREATE_SERVICE']
+        unit = unit_dir / (service + '.service')
+        dropin_dir = unit_dir / (service + '.service.d')
+        # Reproduce upstream's first-unit artifact snapshot rejection.
+        assert unit.exists() or not dropin_dir.exists(), 'drop-in predates native unit'
+        entry = str(package / 'dist/index.js')
+        if os.environ.get('FOREIGN_SERVICE'):
+            entry = '/unrelated/openclaw/dist/index.js'
+        unit.write_text('[Service]\nExecStart=/usr/bin/node --max-old-space-size=2048 "' + entry + '" gateway\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw\n')
+        if os.environ.get('WAIT_SIGNAL'):
+            def terminated(signum, frame):
+                time.sleep(0.15)
+                assert not dropin_dir.exists(), 'postflight raced unreaped CLI'
+                (home / 'signal-forwarded').write_text(str(signum))
+                sys.exit(0)
+            for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(sig, terminated)
+            (home / 'child-ready').touch()
+            while True:
+                time.sleep(0.05)
+    if os.environ.get('NEED_STDIN'):
+        assert sys.stdin.readline().strip() == 'interactive input'
+    if os.environ.get('RUNTIME_EXIT'):
+        sys.exit(int(os.environ['RUNTIME_EXIT']))
     print(json.dumps({'version': version, 'args': args[2:],
                       'wrapper': os.environ.get('OPENCLAW_WRAPPER'),
                       'prefix': os.environ['npm_config_prefix'],
@@ -89,7 +118,14 @@ class Runtime(unittest.TestCase):
         (self.bin / 'mise').chmod(0o755)
         (self.bin / 'runtime-tool').write_text(RUNTIME)
         (self.bin / 'runtime-tool').chmod(0o755)
-        (self.bin / 'systemctl').write_text('#!/bin/bash\nexit 1\n')
+        (self.bin / 'systemctl').write_text('''#!/bin/bash
+printf '%s\\n' "$*" >> "$HOME/systemctl-calls"
+case "$*" in
+  *is-enabled*) [[ ${SERVICE_ENABLED:-0} == 1 ]] ;;
+  *is-active*) [[ ${SERVICE_ACTIVE:-0} == 1 ]] ;;
+  *) exit 0 ;;
+esac
+''')
         (self.bin / 'systemctl').chmod(0o755)
         # Relocate only the package-owned absolute path in this fixture install.
         wrapper = (PACKAGE / 'openclaw').read_text().replace(
@@ -243,7 +279,16 @@ class Runtime(unittest.TestCase):
         self.assertEqual(credentials.read_text(), 'keep credentials')
         self.assertTrue((self.home / 'node-installed').exists())
 
+    def create_unit(self, service='gateway'):
+        directory = self.home / '.config/systemd/user'
+        directory.mkdir(parents=True, exist_ok=True)
+        unit = directory / f'openclaw-{service}.service'
+        unit.write_text('[Service]\nExecStart=/usr/bin/node /usr/lib/node_modules/openclaw/dist/index.js gateway\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw\n')
+        return unit
+
     def test_service_environment_survives_unit_regeneration(self):
+        self.create_unit('gateway')
+        self.create_unit('node')
         self.success('--install')
         units = self.home / '.config/systemd/user'
         for service in ('openclaw-gateway', 'openclaw-node'):
@@ -261,6 +306,8 @@ class Runtime(unittest.TestCase):
         self.assertEqual(len(self.installs()), 1)
 
     def test_foreign_dropin_is_not_overwritten_or_removed(self):
+        self.create_unit('gateway')
+        self.create_unit('node')
         self.success('--install')
         directory = self.home / '.config/systemd/user/openclaw-gateway.service.d'
         own_name = directory / '50-omarchy-runtime.conf'
@@ -332,10 +379,105 @@ class Runtime(unittest.TestCase):
         self.home.mkdir()
         self.env['HOME'] = str(self.home)
         self.prefix = self.home / '.local/share/openclaw/runtime'
+        self.create_unit('gateway')
         self.success('--install')
         content = (self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').read_text()
         self.assertIn('percent%%home', content)
         self.assertNotIn('percent%home', content)
+
+    def test_first_unit_has_no_precreated_dropin_and_gets_live_environment_after_install(self):
+        self.success('--install')
+        units = self.home / '.config/systemd/user'
+        self.assertFalse(units.exists())
+        self.success('gateway', 'install', launcher=True, CREATE_SERVICE='gateway',
+                     SERVICE_ACTIVE='1', SERVICE_ENABLED='1')
+        dropin = units / 'openclaw-gateway.service.d/50-omarchy-runtime.conf'
+        self.assertTrue(dropin.exists())
+        calls = (self.home / 'systemctl-calls').read_text()
+        self.assertIn('--user daemon-reload', calls)
+        self.assertIn('--user try-restart openclaw-gateway.service', calls)
+        inode = dropin.stat().st_ino
+        (self.home / 'systemctl-calls').unlink()
+        self.success('gateway', 'install', launcher=True, CREATE_SERVICE='gateway',
+                     SERVICE_ACTIVE='1', SERVICE_ENABLED='1')
+        self.assertEqual(dropin.stat().st_ino, inode)
+        self.assertFalse((self.home / 'systemctl-calls').exists())
+
+    def test_postflight_preserves_stopped_or_disabled_services(self):
+        for active, enabled in [('0', '1'), ('1', '0')]:
+            self.success('gateway', 'install', launcher=True, CREATE_SERVICE='gateway',
+                         SERVICE_ACTIVE=active, SERVICE_ENABLED=enabled)
+            dropin = self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf'
+            self.assertTrue(dropin.exists())
+            self.assertNotIn('try-restart', (self.home / 'systemctl-calls').read_text())
+            dropin.unlink()
+            (self.home / 'systemctl-calls').unlink()
+
+    def test_readonly_poll_does_not_race_new_unit_publication(self):
+        self.success('--install')
+        self.success('dashboard', '--json', launcher=True, CREATE_SERVICE='gateway')
+        self.assertFalse((self.home / '.config/systemd/user/openclaw-gateway.service.d').exists())
+
+    def test_postflight_rejects_foreign_unit_written_by_cli(self):
+        self.success('--install')
+        result = self.command('gateway', 'install', launcher=True,
+                              CREATE_SERVICE='gateway', FOREIGN_SERVICE='1')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.home / '.config/systemd/user/openclaw-gateway.service.d').exists())
+
+    def test_interactive_stdin_and_cli_exit_status_are_preserved(self):
+        self.success('--install')
+        self.prepare()
+        result = subprocess.run([str(self.bin / 'openclaw'), 'onboard'],
+                                env=dict(self.env, NEED_STDIN='1'), user=self.user,
+                                input='interactive input\n', text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.command('doctor', launcher=True, RUNTIME_EXIT='37').returncode, 37)
+
+    def terminate_lifecycle(self, sig):
+        self.success('--install')
+        self.prepare()
+        process = subprocess.Popen([str(self.bin / 'openclaw'), 'onboard'],
+                                   env=dict(self.env, CREATE_SERVICE='gateway', WAIT_SIGNAL='1',
+                                            SERVICE_ACTIVE='1', SERVICE_ENABLED='1'),
+                                   user=self.user, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        deadline = time.monotonic() + 5
+        while not (self.home / 'child-ready').exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue((self.home / 'child-ready').exists())
+        process.send_signal(sig)
+        _, error = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 128 + sig, error)
+        self.assertEqual((self.home / 'signal-forwarded').read_text(), str(sig))
+        self.assertTrue((self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').exists())
+        self.assertIn('try-restart openclaw-gateway.service', (self.home / 'systemctl-calls').read_text())
+
+    def test_termination_reaches_cli_and_postflight_waits_for_exit(self):
+        self.terminate_lifecycle(signal.SIGTERM)
+
+    def test_interrupt_reaches_cli_and_postflight_waits_for_exit(self):
+        self.terminate_lifecycle(signal.SIGINT)
+
+    def test_hangup_reaches_cli_and_postflight_waits_for_exit(self):
+        self.terminate_lifecycle(signal.SIGHUP)
+
+    def test_global_options_preserve_lifecycle_detection_and_full_argv(self):
+        self.success('--install')
+        result = json.loads(self.success('--no-color', '--log-level', 'debug', 'gateway', 'install',
+                                         launcher=True, CREATE_SERVICE='gateway'))
+        self.assertEqual(result['args'], ['--no-color', '--log-level', 'debug', 'gateway', 'install'])
+        self.assertTrue((self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').exists())
+
+    def test_global_options_between_command_and_subcommand_keep_postflight(self):
+        self.success('--install')
+        self.success('gateway', '--no-color', 'install', launcher=True, CREATE_SERVICE='gateway')
+        self.assertTrue((self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').exists())
+
+    def test_dashboard_yes_installs_receive_service_environment(self):
+        self.success('--install')
+        self.success('dashboard', '--yes', launcher=True, CREATE_SERVICE='gateway')
+        self.assertTrue((self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').exists())
 
     def test_rejects_arbitrary_npm_specs(self):
         for version in ('file:/tmp/package', 'https://example.com/pkg.tgz', '--prefix=/tmp', ''):

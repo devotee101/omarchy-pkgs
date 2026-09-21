@@ -123,9 +123,14 @@ systemd_escape() {
 
 service_environment() {
     local service dir file temporary path_value prefix_value
+    local restart_changed=${1:-false}
+    local -a changed=()
     path_value=$(systemd_escape "$node_bin:$HOME/.local/bin:$HOME/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
     prefix_value=$(systemd_escape "$prefix")
     for service in openclaw-gateway openclaw-node; do
+        # Upstream fingerprints native unit artifacts during publication. A
+        # drop-in created before the first main unit makes that install fail.
+        [[ -f "$unit_dir/$service.service" ]] || continue
         dir="$unit_dir/$service.service.d"
         file="$dir/$dropin_name"
         mkdir -p "$dir"
@@ -134,12 +139,99 @@ service_environment() {
             "Environment=\"PATH=$path_value\"" \
             "Environment=\"npm_config_prefix=$prefix_value\"" \
             'UnsetEnvironment=NPM_CONFIG_PREFIX OPENCLAW_WRAPPER' >"$temporary"
+        if [[ -f "$file" ]] && cmp -s -- "$temporary" "$file"; then
+            rm -- "$temporary"
+            continue
+        fi
         chmod 644 "$temporary"
         mv -f -- "$temporary" "$file"
+        changed+=("$service.service")
     done
+    (( ${#changed[@]} )) || return 0
     # A cold installation may not have a user manager yet. The files are read
     # when that manager starts, and the installer reloads before binding units.
     systemctl --user daemon-reload >/dev/null 2>&1 || true
+    if [[ "$restart_changed" == true ]]; then
+        for service in "${changed[@]}"; do
+            # A newly installed running service must inherit npm's prefix.
+            # Do not activate services the user stopped or disabled.
+            if systemctl --user is-enabled --quiet "$service" &&
+                systemctl --user is-active --quiet "$service"; then
+                systemctl --user try-restart "$service"
+            fi
+        done
+    fi
+}
+
+run_lifecycle() {
+    local child status=0 signal_status=0 cleanup_status
+    # Keep stdin attached for interactive onboarding. Signals sent to the
+    # launcher must reach the actual CLI before we inspect its completed unit.
+    # Bash otherwise starts asynchronous commands with SIGINT ignored.
+    env --default-signal=INT,QUIT "$node_bin/node" "$runtime" "$@" <&0 &
+    child=$!
+    trap 'signal_status=143; kill -TERM "$child" 2>/dev/null || true' TERM
+    trap 'signal_status=130; kill -INT "$child" 2>/dev/null || true' INT
+    trap 'signal_status=129; kill -HUP "$child" 2>/dev/null || true' HUP
+    while true; do
+        if wait "$child"; then status=0; else status=$?; fi
+        # A trapped signal interrupts wait while the CLI may still be writing
+        # its service. Reap it fully before touching any service artifact.
+        kill -0 "$child" 2>/dev/null || break
+    done
+    trap - TERM INT HUP
+    (( signal_status == 0 )) || status=$signal_status
+    set +e
+    (
+        set -e
+        lock
+        check_dropins
+        service_environment true
+    )
+    cleanup_status=$?
+    set -e
+    if (( cleanup_status != 0 )); then
+        printf 'OpenClaw: service environment setup failed; rerun /usr/lib/openclaw/bootstrap --install.\n' >&2
+        (( status != 0 )) || status=$cleanup_status
+    fi
+    return "$status"
+}
+
+lifecycle_command() {
+    local argument
+    local -a command_args=()
+    # Classify the command without removing root options from the real argv.
+    # Named profiles/dev use different native unit names and remain separate
+    # from Omarchy's default gateway/node service integration.
+    while (( $# )); do
+        case "$1" in
+            --no-color) shift ;;
+            --log-level) (( $# >= 2 )) || return 1; shift 2 ;;
+            --log-level=*) shift ;;
+            --profile)
+                [[ ${2:-} == default ]] || return 1
+                shift 2
+                ;;
+            --profile=default) shift ;;
+            --profile=*|--dev|--container|--container=*|--help|-h|--version|-V) return 1 ;;
+            --) shift; command_args+=("$@"); break ;;
+            *) command_args+=("$1"); shift ;;
+        esac
+    done
+    set -- "${command_args[@]}"
+    if [[ ${1:-} == dashboard ]]; then
+        # JSON probes never install a gateway; interactive/--yes dashboard can.
+        for argument in "$@"; do
+            [[ "$argument" == --json ]] && return 1
+        done
+        return 0
+    fi
+    case "${1:-} ${2:-}" in
+        'update status'|'update --help') return 1 ;;
+        'onboard '*|'configure '*|'setup '*|'doctor '*|'update '*|\
+        'gateway install'|'node install'|'daemon install') return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 install_runtime() {
@@ -220,7 +312,14 @@ case "${1:-}" in
         fi
         node_environment ||
             fail 'Node is missing. Run /usr/lib/openclaw/bootstrap --install to repair it.'
-        exec "$node_bin/node" "$runtime" "$@"
+        # Only service-changing commands perform postflight. Status/dashboard
+        # polling during onboarding must not race upstream unit publication.
+        if lifecycle_command "$@"; then
+            check_dropins
+            run_lifecycle "$@"
+        else
+            exec "$node_bin/node" "$runtime" "$@"
+        fi
         ;;
     *) fail 'Usage: bootstrap --check | --install [version] | --remove | --prefix' ;;
 esac

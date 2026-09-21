@@ -22,7 +22,7 @@ optdepends=(
     'go: for installing skill tools not packaged for Arch'
 )
 source=(bootstrap openclaw openclaw.png LICENSE)
-sha256sums=('64df3b6cb58a51153627d4e3c3ef113be5e3f6c6fb9ba24ba3ff828d107499ad'
+sha256sums=('278b23e8535baf98cc13917a768f9e23547c7307f5d49d26541a7c1f46c35c4f'
             '967450eae8b431a7c09bbe579ca5479531356b0de4b0bdf60b6efccbdf1f726f'
             'e8c7ce0a3a6c52bd904cc55e31a5b3a8b6392dcd70ba9e220ecf0ef1d6bd8c16'
             '73571b25326281d369087f469842c02444fe39faaecebda4d82ed21ff3a1c29d')
