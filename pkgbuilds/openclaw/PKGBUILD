@@ -2,14 +2,14 @@
 pkgname=openclaw
 epoch=1
 pkgver=1.0.0
-pkgrel=1
+pkgrel=2
 pkgdesc='User-owned OpenClaw installation and launcher with upstream self-updates'
 arch=(x86_64 aarch64)
 url=https://github.com/openclaw/openclaw
 license=(MIT)
-depends=(bash mise-bin util-linux)
+# OpenClaw 2026.9.5 supports Node >=24.16 <25 or >=26.1; use Arch's current line.
+depends=(bash 'nodejs>=26.1.0' npm util-linux)
 optdepends=(
-    'nodejs: retain an existing system runtime selected by OpenClaw services'
     '1password-cli: 1password skill'
     'curl: weather, openai-whisper-api skills'
     'ffmpeg: video-frames skill'
@@ -22,7 +22,7 @@ optdepends=(
     'go: for installing skill tools not packaged for Arch'
 )
 source=(bootstrap openclaw openclaw.png LICENSE)
-sha256sums=('278b23e8535baf98cc13917a768f9e23547c7307f5d49d26541a7c1f46c35c4f'
+sha256sums=('dfb0a78554a9f7b2fc7f8c95a9f89f0552f0d4e7dfdce4ad5a03469554f93351'
             '967450eae8b431a7c09bbe579ca5479531356b0de4b0bdf60b6efccbdf1f726f'
             'e8c7ce0a3a6c52bd904cc55e31a5b3a8b6392dcd70ba9e220ecf0ef1d6bd8c16'
             '73571b25326281d369087f469842c02444fe39faaecebda4d82ed21ff3a1c29d')

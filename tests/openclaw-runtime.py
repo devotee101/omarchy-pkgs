@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the shipped bootstrap against fake mise/npm, never the host runtime."""
+"""Exercise the shipped bootstrap against an isolated system Node/npm fixture, never the host runtime."""
 import json
 import os
 from pathlib import Path
@@ -13,38 +13,14 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'pkgbuilds/openclaw'
 
-MISE = r'''#!/usr/bin/env python3
-import json, os, pathlib, sys, time
-args = sys.argv[1:]
-home = pathlib.Path(os.environ['HOME'])
-with open(home / 'calls', 'a') as log:
-    log.write(json.dumps(args) + '\n')
-assert pathlib.Path.cwd() == home, 'mise must not read a project config'
-assert args[1] == 'node@26', args
-if args[0] == 'where':
-    print(home / 'mise/installs/node/26.1.0')
-    sys.exit(0 if (home / 'node-installed').exists() else 1)
-if args[0] == 'install':
-    if os.environ.get('FAIL_NODE'):
-        sys.exit(19)
-    (home / 'node-installed').touch()
-    node_bin = home / 'mise/installs/node/26.1.0/bin'
-    node_bin.mkdir(parents=True, exist_ok=True)
-    for tool in ('node', 'npm'):
-        target = node_bin / tool
-        if not target.exists():
-            target.symlink_to(pathlib.Path(__file__).with_name('runtime-tool'))
-    sys.exit(0)
-raise AssertionError('mise exec would load project environment')
-'''
-
 RUNTIME = r'''#!/usr/bin/env python3
-import json, os, pathlib, signal, sys, time
+import json, os, pathlib, shutil, signal, sys, time
 home = pathlib.Path(os.environ['HOME'])
 args = [pathlib.Path(sys.argv[0]).name, *sys.argv[1:]]
 with open(home / 'calls', 'a') as log:
     log.write(json.dumps(args) + '\n')
-assert (home / 'node-installed').exists()
+assert pathlib.Path(shutil.which('node')).parent == pathlib.Path(__file__).parent
+assert pathlib.Path(shutil.which('npm')).parent == pathlib.Path(__file__).parent
 if args[0] == 'npm':
     assert args[1:3] == ['install', '--global'], args
     assert '--allow-scripts=openclaw' in args
@@ -78,7 +54,10 @@ else:
         entry = str(package / 'dist/index.js')
         if os.environ.get('FOREIGN_SERVICE'):
             entry = '/unrelated/openclaw/dist/index.js'
-        unit.write_text('[Service]\nExecStart=/usr/bin/node --max-old-space-size=2048 "' + entry + '" gateway\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw\n')
+        entry = entry.replace('%', '%%')
+        if any(character.isspace() or character in '"\\' for character in entry):
+            entry = '"' + entry.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        unit.write_text('[Service]\nExecStart=/usr/bin/node --max-old-space-size=2048 ' + entry + ' gateway\nEnvironment=OPENCLAW_SERVICE_MARKER=openclaw\n')
         if os.environ.get('WAIT_SIGNAL'):
             def terminated(signum, frame):
                 time.sleep(0.15)
@@ -112,12 +91,20 @@ class Runtime(unittest.TestCase):
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.bootstrap = self.bin / 'bootstrap'
-        shutil.copyfile(PACKAGE / 'bootstrap', self.bootstrap)
+        self.system_bin = self.root / 'system/bin'
+        self.system_bin.mkdir(parents=True)
+        # Relocate only the fixed system runtime path; no production override.
+        self.bootstrap.write_text((PACKAGE / 'bootstrap').read_text().replace(
+            'node_bin=/usr/bin', 'node_bin="' + str(self.system_bin) + '"'))
         self.bootstrap.chmod(0o755)
-        (self.bin / 'mise').write_text(MISE)
-        (self.bin / 'mise').chmod(0o755)
-        (self.bin / 'runtime-tool').write_text(RUNTIME)
-        (self.bin / 'runtime-tool').chmod(0o755)
+        for tool in ('node', 'npm'):
+            (self.system_bin / tool).write_text(RUNTIME)
+            (self.system_bin / tool).chmod(0o755)
+        # Every scenario starts with hostile interactive version-manager tools.
+        # The bootstrap must neither invoke mise nor select its node/npm shims.
+        for tool in ('mise', 'node', 'npm'):
+            (self.bin / tool).write_text('#!/bin/bash\ntouch "$HOME/unexpected-version-manager-tool"\nprintf "unexpected version-manager tool\\n" >&2\nexit 91\n')
+            (self.bin / tool).chmod(0o755)
         (self.bin / 'systemctl').write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$HOME/systemctl-calls"
 case "$*" in
@@ -183,7 +170,7 @@ esac
         self.assertFalse(self.prefix.exists())
         self.assertEqual(self.calls(), [])
 
-    def test_install_uses_mise_without_modifying_user_config(self):
+    def test_install_uses_system_tools_despite_shadowing_without_modifying_user_config(self):
         config = self.home / '.npmrc'
         config.write_text('prefix=/unrelated/prefix\n')
         self.success('--install', '2026.9.4')
@@ -191,6 +178,7 @@ esac
         self.assertEqual(config.read_text(), 'prefix=/unrelated/prefix\n')
         self.assertEqual(len(self.installs()), 1)
         self.assertFalse((self.home / '.config/mise/config.toml').exists())
+        self.assertFalse((self.home / 'unexpected-version-manager-tool').exists())
         self.assertFalse((self.prefix / '.bootstrap-incomplete').exists())
 
     def test_wrapper_preserves_self_update_and_forwards_arguments(self):
@@ -239,9 +227,14 @@ esac
         self.assertEqual(self.success('--check').strip(), '2026.9.4')
         self.assertEqual(len(self.installs()), 2)
 
-    def test_failed_node_or_version_check_is_not_ready(self):
-        self.assertEqual(self.command('--install', FAIL_NODE='1').returncode, 19)
+    def test_missing_node_or_failed_version_check_is_not_ready(self):
+        node = self.system_bin / 'node'
+        node.rename(self.system_bin / 'node.saved')
+        result = self.command('--install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Reinstall the nodejs and npm packages', result.stderr)
         self.assertEqual(self.installs(), [])
+        (self.system_bin / 'node.saved').rename(node)
         self.assertNotEqual(self.command('--install', FAIL_VERSION='1').returncode, 0)
         self.assertNotEqual(self.command('--check').returncode, 0)
         self.success('--install')
@@ -249,12 +242,25 @@ esac
 
     def test_missing_node_requires_explicit_repair_without_resetting_runtime(self):
         self.success('--install', '2026.9.4')
-        (self.home / 'node-installed').unlink()
+        (self.system_bin / 'node').rename(self.system_bin / 'node.saved')
         self.assertNotEqual(self.command('--version', launcher=True).returncode, 0)
         self.assertNotEqual(self.command('--check').returncode, 0)
+        self.assertNotEqual(self.command('--install').returncode, 0)
+        (self.system_bin / 'node.saved').rename(self.system_bin / 'node')
         self.success('--install')
         self.assertEqual(self.success('--check').strip(), '2026.9.4')
         self.assertEqual(len(self.installs()), 1)
+
+    def test_missing_system_npm_does_not_fall_back_to_version_manager(self):
+        self.success('--install', '2026.9.4')
+        (self.system_bin / 'npm').rename(self.system_bin / 'npm.saved')
+        result = self.command('update', launcher=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Reinstall the nodejs and npm packages', result.stderr)
+        self.assertNotIn('unexpected version-manager tool', result.stderr)
+        self.assertEqual(len(self.installs()), 1)
+        package = self.prefix / 'lib/node_modules/openclaw/package.json'
+        self.assertEqual(json.loads(package.read_text())['version'], '2026.9.4')
 
     def test_concurrent_first_installs_only_install_npm_once(self):
         self.prepare()
@@ -277,7 +283,8 @@ esac
         self.success('--remove')
         self.assertFalse(self.prefix.exists())
         self.assertEqual(credentials.read_text(), 'keep credentials')
-        self.assertTrue((self.home / 'node-installed').exists())
+        self.assertTrue((self.system_bin / 'node').exists())
+        self.assertTrue((self.system_bin / 'npm').exists())
 
     def create_unit(self, service='gateway'):
         directory = self.home / '.config/systemd/user'
@@ -295,7 +302,8 @@ esac
             dropin = units / f'{service}.service.d/50-omarchy-runtime.conf'
             content = dropin.read_text()
             self.assertIn(f'Environment="npm_config_prefix={self.prefix}"', content)
-            self.assertIn(f'Environment="PATH={self.home}/mise/installs/node/26.1.0/bin:', content)
+            self.assertIn(f'Environment="PATH={self.system_bin}:', content)
+            self.assertNotIn('mise', content)
             self.assertIn('UnsetEnvironment=NPM_CONFIG_PREFIX OPENCLAW_WRAPPER', content)
             # Upstream rewrites its main service file, leaving drop-ins intact.
             (units / f'{service}.service').write_text(
@@ -384,6 +392,26 @@ esac
         content = (self.home / '.config/systemd/user/openclaw-gateway.service.d/50-omarchy-runtime.conf').read_text()
         self.assertIn('percent%%home', content)
         self.assertNotIn('percent%home', content)
+
+    def test_native_user_runtime_with_systemd_specifiers_is_recognized(self):
+        for name in ('percent%home', 'percent% home'):
+            with self.subTest(home=name):
+                self.home = self.root / name
+                self.home.mkdir()
+                self.env['HOME'] = str(self.home)
+                self.prefix = self.home / '.local/share/openclaw/runtime'
+                self.success('--install')
+                self.success('gateway', 'install', launcher=True, CREATE_SERVICE='gateway',
+                             SERVICE_ACTIVE='1', SERVICE_ENABLED='1')
+                units = self.home / '.config/systemd/user'
+                unit = units / 'openclaw-gateway.service'
+                self.assertIn(name.replace('%', '%%'), unit.read_text())
+                dropin = units / 'openclaw-gateway.service.d/50-omarchy-runtime.conf'
+                self.assertTrue(dropin.exists())
+                inode = dropin.stat().st_ino
+                self.success('--install')
+                self.assertEqual(dropin.stat().st_ino, inode)
+                self.assertEqual(len(self.installs()), 1)
 
     def test_first_unit_has_no_precreated_dropin_and_gets_live_environment_after_install(self):
         self.success('--install')

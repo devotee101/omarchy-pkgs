@@ -1,7 +1,7 @@
 post_install() {
     printf '%s\n' \
         '==> Run omarchy-install-openclaw-cli as your desktop user to set up OpenClaw.' \
-        '==> OpenClaw owns its runtime updates; this package only supplies integration.'
+        '==> OpenClaw owns its application updates; Arch supplies Node/npm and this integration.'
 }
 
 post_upgrade() {
