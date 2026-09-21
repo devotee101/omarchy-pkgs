@@ -1,0 +1,1454 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/expectation.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/expectation.rs
+@@ -628,7 +628,9 @@
+         // existing contract; an explicit incomplete/protected value fails closed.
+         if field == "value"
+             && (element.get("value_complete").and_then(Value::as_bool) == Some(false)
+-                || element.get("protected").and_then(Value::as_bool) == Some(true))
++                || element
++                    .get("protected")
++                    .is_some_and(|v| v.as_bool() != Some(false)))
+         {
+             return (
+                 VerificationStatus::Unknown,
+@@ -751,7 +753,11 @@
+         "selected",
+         "frame",
+     ] {
+-        if key == "value" && element.get("protected").and_then(Value::as_bool) == Some(true) {
++        if key == "value"
++            && element
++                .get("protected")
++                .is_some_and(|v| v.as_bool() != Some(false))
++        {
+             continue;
+         }
+         if let Some(value) = element.get(key) {
+@@ -846,6 +852,15 @@
+             },
+         );
+         assert_eq!(outcomes[0].status, VerificationStatus::Satisfied);
++    }
++
++    #[test]
++    fn unknown_native_protection_never_projects_a_value() {
++        assert!(
++            project_element(&json!({"value": "secret", "protected": null}))
++                .get("value")
++                .is_none()
++        );
+     }
+ 
+     #[test]
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
+@@ -56,7 +56,9 @@
+     pub value_status: String,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub value_source: Option<String>,
+-    pub protected: bool,
++    /// null means native protection could not be established.
++    pub protected: Option<bool>,
++    pub protection_source: String,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub input_type: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+@@ -71,6 +73,9 @@
+     pub description_source: Option<String>,
+     pub description_complete: bool,
+     pub attributes_complete: bool,
++    /// Whitelisted identification attributes from native GetAttributes; never field content.
++    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
++    pub native_attributes: std::collections::BTreeMap<String, String>,
+ }
+ 
+ impl Default for NativeTextObservation {
+@@ -81,7 +86,8 @@
+             value_complete: false,
+             value_status: "not_applicable".into(),
+             value_source: None,
+-            protected: false,
++            protected: None,
++            protection_source: "unavailable".into(),
+             input_type: None,
+             input_type_source: None,
+             placeholder: None,
+@@ -91,6 +97,7 @@
+             description_source: None,
+             description_complete: false,
+             attributes_complete: false,
++            native_attributes: Default::default(),
+         }
+     }
+ }
+@@ -259,13 +266,21 @@
+     }
+ }
+ 
+-/// Perform the first advertised action on element `idx` within pid's app tree.
+-/// Returns `Ok((action_name, suspected_noop))` on success — `suspected_noop`
+-/// is true when the actuated node looked like a silent no-op (a passive
+-/// display role, or no advertised action), so the caller can surface
+-/// `effect: "suspected_noop"`.
++/// Perform a safe native activation, or exact role/state-gated selection, on
++/// this snapshot's retained object. Native acknowledgment alone is not effect
++/// verification; selection includes an independent Selected-state readback.
++pub use native::{NativeActivationOutcome, NativeSelectionOutcome};
++
+ pub fn perform_action(pid: u32, idx: NativeElement) -> Result<(String, bool)> {
+     native::perform_action(pid, idx)
++}
++
++pub fn perform_action_with_cancel(
++    pid: u32,
++    idx: NativeElement,
++    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
++) -> Result<NativeActivationOutcome> {
++    native::perform_action_with_cancel(pid, idx, cancelled)
+ }
+ 
+ /// Give an indexed AT-SPI element keyboard focus without activating its window.
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -616,6 +616,36 @@
+     size: Option<(i32, i32)>,
+ }
+ 
++fn chromium_executable_name(path: &std::path::Path, link_count: u64) -> bool {
++    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
++        return false;
++    };
++    // Only /proc metadata proving an unlinked inode permits interpretation of
++    // the kernel's suffix. A linked executable literally named `chrome
++    // (deleted)` is not an allowlisted Chromium basename.
++    let name = if link_count == 0 {
++        name.strip_suffix(" (deleted)").unwrap_or(name)
++    } else {
++        name
++    };
++    matches!(name, "chromium" | "chromium-browser" | "chrome")
++}
++
++fn is_chromium_executable(pid: u32) -> bool {
++    use std::os::unix::fs::MetadataExt;
++    let executable = format!("/proc/{pid}/exe");
++    let Ok(path) = std::fs::read_link(&executable) else {
++        return false;
++    };
++    let Ok(metadata) = std::fs::metadata(&executable) else {
++        return false;
++    };
++    // Fail closed if exec/replacement changed the reported path while reading
++    // metadata. Existing snapshot process and peer checks remain in force.
++    std::fs::read_link(&executable).ok().as_ref() == Some(&path)
++        && chromium_executable_name(&path, metadata.nlink())
++}
++
+ fn chromium_title_matches(accessible: &str, native: &str) -> bool {
+     if native.is_empty() {
+         return false;
+@@ -693,6 +723,44 @@
+         }
+     }
+     #[test]
++    fn chromium_executable_suffix_requires_unlinked_inode_and_exact_basename() {
++        for name in ["chromium", "chromium-browser", "chrome"] {
++            assert!(chromium_executable_name(std::path::Path::new(name), 1));
++            let deleted = format!("/usr/lib/browser/{name} (deleted)");
++            assert!(chromium_executable_name(std::path::Path::new(&deleted), 0));
++            assert!(!chromium_executable_name(std::path::Path::new(&deleted), 1));
++        }
++        for name in [
++            "firefox",
++            "chrome-helper",
++            "unknown (deleted)",
++            "chrome (deleted) (deleted)",
++        ] {
++            assert!(!chromium_executable_name(std::path::Path::new(name), 0));
++            assert!(!chromium_executable_name(std::path::Path::new(name), 1));
++        }
++    }
++
++    #[test]
++    fn chromium_executable_recognizes_actual_deleted_proc_inode() {
++        let dir = tempfile::tempdir().unwrap();
++        let executable = dir.path().join("chromium");
++        std::fs::copy("/usr/bin/sleep", &executable).unwrap();
++        let mut child = std::process::Command::new(&executable)
++            .arg("30")
++            .spawn()
++            .unwrap();
++        let checked = (|| -> Result<bool> {
++            let linked = is_chromium_executable(child.id());
++            std::fs::remove_file(&executable)?;
++            Ok(linked && is_chromium_executable(child.id()))
++        })();
++        let _ = child.kill();
++        let _ = child.wait();
++        assert!(checked.unwrap());
++    }
++
++    #[test]
+     fn profile_and_audio_decorations_bind_only_the_requested_frame() {
+         for (native, ax) in [
+             ("Page - Chromium", "Page - Chromium - Spencer (Work)"),
+@@ -829,15 +897,7 @@
+         let windows = crate::wayland::hyprland::list_windows().ok()?;
+         let owned: Vec<_> = windows.iter().filter(|w| w.pid == pid).collect();
+         let target = owned.iter().position(|w| w.address == xid)?;
+-        let chromium = std::fs::read_link(format!("/proc/{pid}/exe"))
+-            .ok()
+-            .and_then(|path| {
+-                path.file_name()
+-                    .map(|name| name.to_string_lossy().into_owned())
+-            })
+-            .is_some_and(|name| {
+-                matches!(name.as_str(), "chromium" | "chromium-browser" | "chrome")
+-            });
++        let chromium = is_chromium_executable(pid);
+         let mut frames = Vec::new();
+         for (ordinal, oref) in seeds.iter().enumerate() {
+             // Unknown roots could be competing frames; fail closed.
+@@ -1166,20 +1226,10 @@
+             .as_ref()
+             .and_then(|state| state.as_ref().ok())
+             .is_some_and(|state| state.contains(State::Selectable));
+-        let selected = if role_lower.contains("check") {
+-            checked
+-        } else if role_lower.contains("radio")
+-            || role_lower.contains("list item")
+-            || role_lower.contains("menu item")
+-            || matches!(role_lower.as_str(), "tab" | "page tab" | "tab item")
+-        {
+-            state_r
+-                .as_ref()
+-                .and_then(|state| state.as_ref().ok())
+-                .map(|state| state.contains(State::Selected) || state.contains(State::Checked))
+-        } else {
+-            None
+-        };
++        let selected = selected_observation(
++            &role_lower,
++            state_r.as_ref().and_then(|state| state.as_ref().ok()),
++        );
+ 
+         let state = state_r.as_ref().and_then(|state| state.as_ref().ok());
+         let field = is_text_field(&role, state, has_editable);
+@@ -1190,11 +1240,12 @@
+             has_editable,
+             has_text,
+             field,
++            has_value,
+             name_complete,
+         )
+         .await;
+         let mut actions: Vec<String> = Vec::new();
+-        if has_action || has_value || (has_text && !field && !text.protected) {
++        if has_action || has_value || (has_text && !field && text.protected == Some(false)) {
+             if let Some(proxies) = observed_read(call(acc.proxies()).await, &mut traversal) {
+                 if has_action {
+                     if let Some(ap) = observed_read(call(proxies.action()).await, &mut traversal) {
+@@ -1212,7 +1263,7 @@
+                         }
+                     }
+                 }
+-                if has_value && !field && !text.protected {
++                if has_value && !field && text.protected == Some(false) {
+                     text.value_status = "read_failure".into();
+                     text.value_source = Some("atspi.Value.CurrentValue".into());
+                     if let Some(vp) = observed_read(call(proxies.value()).await, &mut traversal) {
+@@ -1226,33 +1277,31 @@
+                         }
+                         .into();
+                         text.value_source = Some("atspi.Value.CurrentValue".into());
++                        if let Some(status) = fresh_read_guard(&acc).await {
++                            value = None;
++                            apply_read_guard_status(&mut text, status);
++                        }
+                     }
+                 }
+                 // Passive document text can remain display text. Editable fields
+                 // always preserve Name, Text value and Description separately.
+                 if has_text
+                     && !field
+-                    && !text.protected
++                    && text.protected == Some(false)
+                     && state.is_some()
+                     && !role.is_empty()
+                     && name.trim().is_empty()
+                 {
+-                    if let Some(tp) = observed_read(call(proxies.text()).await, &mut traversal) {
+-                        if let Some(count) =
+-                            observed_read(call(tp.character_count()).await, &mut traversal)
+-                        {
+-                            if count > 0 {
+-                                if let Some(content) = observed_read(
+-                                    call(tp.get_text(0, count.min(4096))).await,
+-                                    &mut traversal,
+-                                ) {
+-                                    name = content;
+-                                    text.name_source = "atspi.Text".into();
+-                                    text.name_complete =
+-                                        count <= 4096 && name.chars().count() == count as usize;
+-                                }
+-                            }
+-                        }
++                    let (content, status) = read_field_value(&acc).await;
++                    if content.is_none() {
++                        apply_read_guard_status(&mut text, status);
++                        text.name_complete = false;
++                    }
++                    if let Some(content) = content {
++                        name = content.chars().take(4096).collect();
++                        text.name_source = "atspi.Text".into();
++                        text.name_complete =
++                            status == "complete" && content.chars().count() <= 4096;
+                     }
+                 }
+             }
+@@ -1344,6 +1393,61 @@
+         })
+ }
+ 
++fn selected_observation(role: &str, state: Option<&StateSet>) -> Option<bool> {
++    let state = state?;
++    if role.contains("check") {
++        Some(state.contains(State::Checked))
++    } else if role.contains("radio") {
++        Some(state.contains(State::Selected) || state.contains(State::Checked))
++    } else if state.contains(State::Selectable)
++        || role.contains("list item")
++        || role.contains("menu item")
++        || matches!(role, "tab" | "page tab" | "tab item")
++    {
++        Some(state.contains(State::Selected))
++    } else {
++        None
++    }
++}
++
++fn apply_read_guard_status(text: &mut NativeTextObservation, status: &str) {
++    if status == "protected" {
++        text.protected = Some(true);
++        text.protection_source = "atspi.Role/Attributes".into();
++    } else if status == "protection_unknown" {
++        text.protected = None;
++        text.protection_source = "unavailable".into();
++    }
++    text.value_status = status.into();
++    text.value_complete = status == "complete";
++}
++
++async fn fresh_read_guard(acc: &AccessibleProxy<'_>) -> Option<&'static str> {
++    let (role, state, attrs) = tokio::join!(
++        call(acc.get_role_name()),
++        call(acc.get_state()),
++        call(acc.get_attributes())
++    );
++    let role = role.and_then(Result::ok);
++    let state = state.and_then(Result::ok);
++    let attrs = attrs.and_then(Result::ok);
++    text_read_guard(role.as_deref(), state.as_ref(), attrs.as_ref())
++}
++
++fn protection_evidence(
++    role: &str,
++    state: Option<&StateSet>,
++    attrs: Option<&NativeAttributes>,
++) -> Option<bool> {
++    if is_protected_field(role, attrs) {
++        Some(true)
++    } else if role.is_empty() || state.is_none() || attrs.is_none() {
++        None
++    } else {
++        Some(false)
++    }
++}
++
+ fn field_metadata(
+     role: &str,
+     state: Option<&StateSet>,
+@@ -1354,7 +1458,15 @@
+     let mut text = NativeTextObservation {
+         editable: state.map(|s| s.contains(State::Editable) && !s.contains(State::ReadOnly)),
+         editable_source: state.map(|_| "atspi.State.Editable/ReadOnly".into()),
+-        protected: is_protected_field(role, attrs),
++        protected: protection_evidence(role, state, attrs),
++        protection_source: if is_protected_field(role, attrs) {
++            "atspi.Role/Attributes"
++        } else if !role.is_empty() && state.is_some() && attrs.is_some() {
++            "atspi.Role/State/Attributes"
++        } else {
++            "unavailable"
++        }
++        .into(),
+         value_status: "not_applicable".into(),
+         name_source: "atspi.Accessible.Name".into(),
+         name_complete,
+@@ -1366,6 +1478,11 @@
+         text.editable_source = Some("atspi.EditableText".into());
+     }
+     if let Some(attrs) = attrs {
++        for key in ["id", "tag", "xml-roles", "autocomplete"] {
++            if let Some(value) = attrs.get(key) {
++                text.native_attributes.insert(key.into(), value.clone());
++            }
++        }
+         if let Some(source) = attrs.get("name-from") {
+             text.name_source = format!("atspi.name-from:{source}");
+         }
+@@ -1451,15 +1568,7 @@
+     // Protection can change while the application services GetText. Do not
+     // publish even a consistent value unless fresh native metadata still
+     // establishes a readable object. This guard also covers action readback.
+-    let (role, state, attrs) = tokio::join!(
+-        call(acc.get_role_name()),
+-        call(acc.get_state()),
+-        call(acc.get_attributes()),
+-    );
+-    let role = role.and_then(Result::ok);
+-    let state = state.and_then(Result::ok);
+-    let attrs = attrs.and_then(Result::ok);
+-    if let Some(status) = text_read_guard(role.as_deref(), state.as_ref(), attrs.as_ref()) {
++    if let Some(status) = fresh_read_guard(acc).await {
+         return (None, status);
+     }
+     match result {
+@@ -1492,11 +1601,12 @@
+     has_editable: bool,
+     has_text: bool,
+     field: bool,
++    has_value: bool,
+     name_complete: bool,
+ ) -> (NativeTextObservation, Option<String>, Option<String>) {
+     // GetAttributes is a method and the Accessible proxy disables property
+     // caching. Never warm a GetAll cache (older Qt bridges crash on GetAll).
+-    let (attrs, description) = if field {
++    let (attrs, description) = if field || has_text || has_value {
+         let (attrs, description) =
+             tokio::join!(call(acc.get_attributes()), call(acc.description()));
+         (attrs.and_then(Result::ok), description.and_then(Result::ok))
+@@ -1513,8 +1623,10 @@
+             .unwrap_or_else(|| "atspi.Accessible.Description".into())
+     });
+     let mut value = None;
+-    if text.protected {
++    if text.protected == Some(true) {
+         text.value_status = "protected".into();
++    } else if (field || has_text || has_value) && text.protected.is_none() {
++        text.value_status = "protection_unknown".into();
+     } else if field {
+         text.value_source = has_text.then(|| "atspi.Text.GetText".into());
+         text.value_status = if attrs.is_none() || state.is_none() || role.is_empty() {
+@@ -1525,7 +1637,7 @@
+             "unavailable".into()
+         } else {
+             let (observed, status) = read_field_value(acc).await;
+-            text.protected |= status == "protected";
++            apply_read_guard_status(&mut text, status);
+             value = observed;
+             status.into()
+         };
+@@ -1931,6 +2043,7 @@
+ /// Markdown readers get the same completeness distinction as structured rows.
+ fn value_markdown(value: Option<&str>, text: &NativeTextObservation) -> String {
+     let mut rendered = value
++        .filter(|_| text.protected == Some(false))
+         .map(|value| format!(" value={}", serde_json::to_string(value).unwrap()))
+         .unwrap_or_default();
+     if text.value_status != "not_applicable" {
+@@ -2663,6 +2776,60 @@
+     })
+ }
+ 
++/// Selection is a separate native operation, never another spelling of click.
++/// Require both a result-like role and the native Selectable state. In
++/// particular, `buffer.select-line` on an editor must never select a result.
++fn selection_action_index(role: &str, selectable: bool, actions: &[String]) -> Option<usize> {
++    if !selectable
++        || !matches!(
++            role.trim().to_ascii_lowercase().as_str(),
++            "list item" | "tree item" | "table cell" | "page tab" | "menu item"
++        )
++    {
++        return None;
++    }
++    actions
++        .iter()
++        .position(|name| name.trim().eq_ignore_ascii_case("select"))
++}
++
++#[derive(Debug)]
++pub struct NativeSelectionOutcome {
++    /// Independently read AT-SPI Selected state after the acknowledged action.
++    pub selected: Option<bool>,
++    pub status: &'static str,
++}
++
++#[derive(Debug)]
++pub struct NativeActivationOutcome {
++    pub action: String,
++    pub suspected_noop: bool,
++    /// Present only for the role/state-gated native Action `select` operation.
++    pub selection: Option<NativeSelectionOutcome>,
++}
++
++fn selection_readback(state: Option<&StateSet>) -> NativeSelectionOutcome {
++    match state {
++        Some(state) if state.contains(State::Defunct) || state.contains(State::Stale) => {
++            NativeSelectionOutcome {
++                selected: None,
++                status: "target_lost",
++            }
++        }
++        Some(state) if state.contains(State::Selectable) => {
++            let selected = state.contains(State::Selected);
++            NativeSelectionOutcome {
++                selected: Some(selected),
++                status: if selected { "selected" } else { "not_selected" },
++            }
++        }
++        _ => NativeSelectionOutcome {
++            selected: None,
++            status: "readback_unavailable",
++        },
++    }
++}
++
+ fn is_menu_role(role: &str) -> bool {
+     role.trim().to_ascii_lowercase().contains("menu")
+ }
+@@ -2766,11 +2933,64 @@
+     )
+ }
+ 
+-async fn activate_retained(pid: u32, element: &NativeElement) -> Result<(String, bool)> {
++/// Some GTK controls expose Component geometry without an Action interface.
++/// Only these positively identified controls may use the existing coordinate
++/// route. An Action interface (including unsupported `select`) always refuses
++/// this classification, even if its action list cannot be read.
++fn coordinate_fallback_safe(
++    role: &str,
++    has_action: bool,
++    has_component: bool,
++    state: &StateSet,
++) -> bool {
++    !has_action
++        && has_component
++        && is_enabled_state(state)
++        && !state.contains(State::Defunct)
++        && !state.contains(State::Stale)
++        && match role.trim().to_ascii_lowercase().as_str() {
++            "button" | "push button" => true,
++            "list item" => state.contains(State::Selectable),
++            _ => false,
++        }
++}
++
++async fn activate_retained(
++    pid: u32,
++    element: &NativeElement,
++    cancelled: &AtomicBool,
++    attempted: &AtomicBool,
++) -> Result<NativeActivationOutcome> {
++    if cancelled.load(Ordering::Acquire) {
++        anyhow::bail!("cancelled_before_delivery");
++    }
+     let target = validated_target(pid, element).await?;
+     let role = call(target.acc.get_role_name())
+         .await
+         .context("native role lookup timed out")??;
++    let interfaces = call(target.acc.get_interfaces())
++        .await
++        .context("native interface lookup timed out")??;
++    if !interfaces.contains(Interface::Action) {
++        let state = call(target.acc.get_state())
++            .await
++            .context("native coordinate fallback state unavailable")??;
++        if coordinate_fallback_safe(
++            &role,
++            false,
++            interfaces.contains(Interface::Component),
++            &state,
++        ) {
++            // This is a pre-dispatch classification, not action success. The
++            // caller must resolve this same retained object's fresh bounds.
++            validated_target(pid, element).await?;
++            if cancelled.load(Ordering::Acquire) {
++                anyhow::bail!("cancelled_before_delivery");
++            }
++            anyhow::bail!("native_coordinate_fallback_safe: enabled native control has Component but no Action interface");
++        }
++        anyhow::bail!("native object has no safe activation or coordinate fallback");
++    }
+     let ap = target.acc.proxies().await?.action().await?;
+     let count = call(ap.n_actions())
+         .await
+@@ -2784,10 +3004,55 @@
+         );
+     }
+     let suspected_noop = actions.is_empty() || is_passive_role(&role);
+-    let chosen = activation_index(&role, &actions)
+-        .context("native object does not advertise a safe activation action")?;
++    let (chosen, is_selection) = match activation_index(&role, &actions) {
++        Some(index) => (index, false),
++        None => {
++            let state = call(target.acc.get_state())
++                .await
++                .context("native selection state unavailable")??;
++            let index = selection_action_index(&role, state.contains(State::Selectable), &actions)
++                .context(
++                    "native object does not advertise a safe activation or selection action",
++                )?;
++            (index, true)
++        }
++    };
+     validated_target(pid, element).await?;
++    if cancelled.load(Ordering::Acquire) {
++        anyhow::bail!("cancelled_before_delivery");
++    }
++    // Recheck the exact advertised ordinal immediately before dispatch. Never
++    // reinterpret an old ordinal after a toolkit mutates its action list.
+     let action = actions[chosen].clone();
++    let fresh_name = call(ap.get_name(chosen as i32))
++        .await
++        .context("native action confirmation timed out")??;
++    if fresh_name != action {
++        anyhow::bail!("native action changed before delivery");
++    }
++    if is_selection {
++        let (fresh_role, fresh_state) = tokio::join!(
++            call(target.acc.get_role_name()),
++            call(target.acc.get_state()),
++        );
++        let fresh_role = fresh_role.context("native selection role unavailable")??;
++        let fresh_state = fresh_state.context("native selection state unavailable")??;
++        if fresh_state.contains(State::Defunct)
++            || fresh_state.contains(State::Stale)
++            || selection_action_index(
++                &fresh_role,
++                fresh_state.contains(State::Selectable),
++                &[fresh_name],
++            )
++            .is_none()
++        {
++            anyhow::bail!("native selection target changed before delivery");
++        }
++    }
++    if cancelled.load(Ordering::Acquire) {
++        anyhow::bail!("cancelled_before_delivery");
++    }
++    attempted.store(true, Ordering::Release);
+     let accepted = ap
+         .do_action(chosen as i32)
+         .await
+@@ -2796,15 +3061,68 @@
+         return Err(anyhow!("native action was not accepted"));
+     }
+     tokio::time::sleep(Duration::from_millis(50)).await;
+-    Ok((action, suspected_noop))
++    if cancelled.load(Ordering::Acquire) {
++        anyhow::bail!("cancelled after delivery");
++    }
++    let selection = if is_selection {
++        Some(match validated_target(pid, element).await {
++            Ok(target) => {
++                let state = call(target.acc.get_state()).await.and_then(Result::ok);
++                // The read itself can race destruction or loss of ancestry.
++                if validated_target(pid, element).await.is_err() {
++                    NativeSelectionOutcome {
++                        selected: None,
++                        status: "target_lost",
++                    }
++                } else {
++                    selection_readback(state.as_ref())
++                }
++            }
++            Err(_) => NativeSelectionOutcome {
++                selected: None,
++                status: "target_lost",
++            },
++        })
++    } else {
++        None
++    };
++    if cancelled.load(Ordering::Acquire) {
++        anyhow::bail!("cancelled after delivery");
++    }
++    Ok(NativeActivationOutcome {
++        action,
++        suspected_noop,
++        selection,
++    })
+ }
+ 
+ pub fn perform_action(pid: u32, element: NativeElement) -> Result<(String, bool)> {
+-    bounded(activate_retained(pid, &element), || {
+-        Err(anyhow!(
+-            "perform_action timed out for pid {pid} (app unresponsive to AT-SPI)"
+-        ))
+-    })
++    perform_action_with_cancel(pid, element, Arc::new(AtomicBool::new(false)))
++        .map(|outcome| (outcome.action, outcome.suspected_noop))
++}
++
++pub fn perform_action_with_cancel(
++    pid: u32,
++    element: NativeElement,
++    cancelled: Arc<AtomicBool>,
++) -> Result<NativeActivationOutcome> {
++    let attempted = AtomicBool::new(false);
++    bounded(
++        async {
++            activate_retained(pid, &element, &cancelled, &attempted).await.map_err(|error| {
++                if attempted.load(Ordering::Acquire) {
++                    anyhow!("outcome_uncertain: native activation or selection was attempted; do not replay")
++                } else { error }
++            })
++        },
++        || {
++            Err(anyhow!(if attempted.load(Ordering::Acquire) {
++                "outcome_uncertain: native activation or selection timed out after delivery began"
++            } else {
++                "native activation or selection timed out before delivery"
++            }))
++        },
++    )
+ }
+ 
+ /// A mutation was attempted; callers must not replay through another route.
+@@ -3374,6 +3692,22 @@
+     )
+ }
+ 
++fn hit_test_timeout(attempted: bool) -> Result<Option<String>> {
++    if attempted {
++        Err(anyhow!("outcome_uncertain: native hit-test activation timed out after delivery began; do not replay"))
++    } else {
++        Ok(None)
++    }
++}
++
++fn hit_test_delivery_error(error: anyhow::Error, attempted: bool) -> anyhow::Error {
++    if attempted {
++        anyhow!("outcome_uncertain: native hit-test activation was attempted; do not replay")
++    } else {
++        error
++    }
++}
++
+ /// Resolve a window-local pixel `(win_x, win_y)` to the deepest actionable
+ /// AT-SPI element covering it and perform its primary action.
+ ///
+@@ -3397,6 +3731,7 @@
+     win_x: i32,
+     win_y: i32,
+ ) -> Result<Option<String>> {
++    let attempted = AtomicBool::new(false);
+     bounded(
+         async {
+             let conn = shared_connection().await?;
+@@ -3460,11 +3795,12 @@
+                 .map(|(_, element)| element)
+                 .find(|element| element.snapshot.visited[element.visited_index].object == object)
+                 .context("native hit target is not retained")?;
+-            activate_retained(pid, &element)
++            activate_retained(pid, &element, &AtomicBool::new(false), &attempted)
+                 .await
+-                .map(|(action, _)| Some(action))
++                .map(|outcome| Some(outcome.action))
++                .map_err(|error| hit_test_delivery_error(error, attempted.load(Ordering::Acquire)))
+         },
+-        || Ok(None),
++        || hit_test_timeout(attempted.load(Ordering::Acquire)),
+     )
+ }
+ 
+@@ -3496,6 +3832,7 @@
+     screen_x: i32,
+     screen_y: i32,
+ ) -> Result<Option<String>> {
++    let attempted = AtomicBool::new(false);
+     bounded(
+         async {
+             if xid == 0 {
+@@ -3529,11 +3866,12 @@
+                 .find(|(index, _)| *index == idx)
+                 .context("native hit target is not retained")?
+                 .1;
+-            activate_retained(pid, &element)
++            activate_retained(pid, &element, &AtomicBool::new(false), &attempted)
+                 .await
+-                .map(|(action, _)| Some(action))
++                .map(|outcome| Some(outcome.action))
++                .map_err(|error| hit_test_delivery_error(error, attempted.load(Ordering::Acquire)))
+         },
+-        || Ok(None),
++        || hit_test_timeout(attempted.load(Ordering::Acquire)),
+     )
+ }
+ 
+@@ -3608,9 +3946,9 @@
+                 let role = role.context("unsupported: field role unavailable")??;
+                 let attrs = attrs.context("unsupported: field attributes unavailable")??;
+                 let interfaces = interfaces.context("unsupported: interfaces unavailable")??;
+-                if is_protected_field(&role, Some(&attrs)) {
++                if text_read_guard(Some(&role), Some(&state), Some(&attrs)).is_some() {
+                     return Err(anyhow!(
+-                        "unsupported: protected field replacement is not exposed"
++                        "unsupported: field protection/readability is not established"
+                     ));
+                 }
+                 let has_editable = interfaces.contains(Interface::EditableText);
+@@ -3684,9 +4022,15 @@
+                     let vp = call(proxies.value())
+                         .await
+                         .context("Value readback unavailable")??;
++                    if fresh_read_guard(&fresh.acc).await.is_some() {
++                        return Err(anyhow!("numeric readback protection unavailable"));
++                    }
+                     let actual = call(vp.current_value())
+                         .await
+                         .context("numeric readback timed out")??;
++                    if fresh_read_guard(&fresh.acc).await.is_some() {
++                        return Err(anyhow!("numeric readback protection changed"));
++                    }
+                     if actual != expected {
+                         return Err(anyhow!("numeric replacement readback differs"));
+                     }
+@@ -3699,7 +4043,9 @@
+                     let state = state.context("readback state unavailable")??;
+                     let role = role.context("readback role unavailable")??;
+                     let attrs = attrs.context("readback attributes unavailable")??;
+-                    if is_protected_field(&role, Some(&attrs)) || state.contains(State::ReadOnly) {
++                    if text_read_guard(Some(&role), Some(&state), Some(&attrs)).is_some()
++                        || state.contains(State::ReadOnly)
++                    {
+                         return Err(anyhow!("field protection changed during replacement"));
+                     }
+                     let (actual, status) = read_field_value(&fresh.acc).await;
+@@ -5069,10 +5415,68 @@
+     use super::*;
+ 
+     #[test]
++    fn selectable_results_expose_fresh_selected_state_and_guard_changes_stay_unknown() {
++        for role in ["tree item", "table cell", "list item", "page tab"] {
++            assert_eq!(
++                selected_observation(
++                    role,
++                    Some(&StateSet::new(State::Selectable | State::Selected))
++                ),
++                Some(true)
++            );
++            assert_eq!(
++                selected_observation(role, Some(&StateSet::new(State::Selectable))),
++                Some(false)
++            );
++            assert_eq!(selected_observation(role, None), None);
++            assert_eq!(
++                selected_observation(
++                    role,
++                    Some(&StateSet::new(State::Selectable | State::Checked))
++                ),
++                Some(false)
++            );
++        }
++        let mut text = NativeTextObservation {
++            protected: Some(false),
++            value_complete: true,
++            ..Default::default()
++        };
++        apply_read_guard_status(&mut text, "protection_unknown");
++        assert_eq!(text.protected, None);
++        assert!(!text.value_complete);
++        apply_read_guard_status(&mut text, "protected");
++        assert_eq!(text.protected, Some(true));
++        assert!(!text.value_complete);
++    }
++
++    #[test]
++    fn protection_unknown_is_not_safe_or_empty() {
++        let state = StateSet::new(State::Editable);
++        let attrs = NativeAttributes::new();
++        assert_eq!(
++            protection_evidence("entry", Some(&state), Some(&attrs)),
++            Some(false)
++        );
++        for (role, state, attrs) in [
++            ("entry", Some(&state), None),
++            ("", Some(&state), Some(&attrs)),
++            ("entry", None, Some(&attrs)),
++        ] {
++            let text = field_metadata(role, state, false, attrs, true);
++            assert_eq!(text.protected, None);
++            assert_eq!(text.protection_source, "unavailable");
++            assert!(!value_markdown(Some("secret"), &text).contains("secret"));
++        }
++        assert_eq!(protection_evidence("password text", None, None), Some(true));
++    }
++
++    #[test]
+     fn markdown_distinguishes_empty_partial_and_unreadable_values() {
+         let text = NativeTextObservation {
+             value_complete: true,
+             value_status: "complete".into(),
++            protected: Some(false),
+             ..Default::default()
+         };
+         assert_eq!(
+@@ -5081,6 +5485,7 @@
+         );
+         let partial = NativeTextObservation {
+             value_status: "truncated".into(),
++            protected: Some(false),
+             ..Default::default()
+         };
+         assert!(value_markdown(Some("x\"\n"), &partial)
+@@ -5088,13 +5493,175 @@
+         assert!(!value_markdown(Some("x\"\n"), &partial).contains('\n'));
+         let protected = NativeTextObservation {
+             value_status: "protected".into(),
+-            protected: true,
++            protected: Some(true),
+             ..Default::default()
+         };
+         assert_eq!(
+             value_markdown(None, &protected),
+             " [value_complete=false value_status=protected]"
+         );
++    }
++
++    #[test]
++    fn hit_test_timeout_or_failure_after_dispatch_never_permits_input_replay() {
++        assert_eq!(hit_test_timeout(false).unwrap(), None);
++        assert!(hit_test_timeout(true)
++            .unwrap_err()
++            .to_string()
++            .starts_with("outcome_uncertain:"));
++        assert_eq!(
++            hit_test_delivery_error(anyhow!("before delivery"), false).to_string(),
++            "before delivery"
++        );
++        assert!(hit_test_delivery_error(anyhow!("provider secret"), true)
++            .to_string()
++            .starts_with("outcome_uncertain:"));
++        assert!(!hit_test_delivery_error(anyhow!("provider secret"), true)
++            .to_string()
++            .contains("provider secret"));
++    }
++
++    #[test]
++    fn component_only_coordinate_fallback_requires_positive_native_control_evidence() {
++        let enabled = StateSet::new(State::Enabled);
++        let selectable = StateSet::new(State::Enabled | State::Selectable);
++        for role in ["button", "push button"] {
++            assert!(coordinate_fallback_safe(role, false, true, &enabled));
++            assert!(!coordinate_fallback_safe(role, true, true, &enabled));
++            assert!(!coordinate_fallback_safe(role, false, false, &enabled));
++            assert!(!coordinate_fallback_safe(
++                role,
++                false,
++                true,
++                &StateSet::empty()
++            ));
++        }
++        assert!(coordinate_fallback_safe(
++            "list item",
++            false,
++            true,
++            &selectable
++        ));
++        assert!(!coordinate_fallback_safe(
++            "list item",
++            false,
++            true,
++            &enabled
++        ));
++        // A select-advertising result has Action and must use exact selection.
++        assert!(!coordinate_fallback_safe(
++            "list item",
++            true,
++            true,
++            &selectable
++        ));
++        for role in ["text", "entry", "combo box", "panel", "list box"] {
++            assert!(!coordinate_fallback_safe(role, false, true, &selectable));
++        }
++        for invalid in [State::Defunct, State::Stale] {
++            let state = StateSet::new(State::Enabled | State::Selectable | invalid);
++            assert!(!coordinate_fallback_safe("list item", false, true, &state));
++        }
++    }
++
++    #[test]
++    fn selection_requires_exact_verb_result_role_and_selectable_state() {
++        let actions = vec!["showContextMenu".into(), "select".into()];
++        for role in [
++            "list item",
++            "tree item",
++            "table cell",
++            "page tab",
++            "menu item",
++        ] {
++            assert_eq!(selection_action_index(role, true, &actions), Some(1));
++            assert_eq!(selection_action_index(role, false, &actions), None);
++        }
++        for role in [
++            "text",
++            "entry",
++            "combo box",
++            "button",
++            "list box",
++            "document web",
++        ] {
++            assert_eq!(selection_action_index(role, true, &actions), None);
++        }
++        for action in [
++            "buffer.select",
++            "select-all",
++            "select-line",
++            "unselect",
++            "selectAncestor",
++        ] {
++            assert_eq!(
++                selection_action_index("list item", true, &[action.into()]),
++                None
++            );
++        }
++        assert_eq!(activation_index("list item", &actions), None);
++    }
++
++    #[test]
++    fn selection_action_reordering_resolves_the_current_exact_ordinal() {
++        assert_eq!(
++            selection_action_index(
++                "list item",
++                true,
++                &["select".into(), "showContextMenu".into()]
++            ),
++            Some(0)
++        );
++        assert_eq!(
++            selection_action_index(
++                "list item",
++                true,
++                &["showContextMenu".into(), "select".into()]
++            ),
++            Some(1)
++        );
++        assert_eq!(
++            selection_action_index("list item", true, &["showContextMenu".into()]),
++            None
++        );
++        assert_eq!(
++            activation_index("list item", &["select".into(), "press".into()]),
++            Some(1)
++        );
++    }
++
++    #[test]
++    fn selection_acknowledgment_needs_independent_selected_state() {
++        let selected = StateSet::new(State::Selectable | State::Selected);
++        let outcome = selection_readback(Some(&selected));
++        assert_eq!(outcome.selected, Some(true));
++        assert_eq!(outcome.status, "selected");
++        let unselected = StateSet::new(State::Selectable);
++        let outcome = selection_readback(Some(&unselected));
++        assert_eq!(outcome.selected, Some(false));
++        assert_eq!(outcome.status, "not_selected");
++        let outcome = selection_readback(None);
++        assert_eq!(outcome.selected, None);
++        assert_eq!(outcome.status, "readback_unavailable");
++        let defunct = StateSet::new(State::Selectable | State::Selected | State::Defunct);
++        let outcome = selection_readback(Some(&defunct));
++        assert_eq!(outcome.selected, None);
++        assert_eq!(outcome.status, "target_lost");
++        assert_eq!(
++            selection_readback(Some(&StateSet::new(State::Selected))).selected,
++            None
++        );
++    }
++
++    #[test]
++    fn selection_cancelled_before_delivery_never_resolves_or_writes_target() {
++        let error = perform_action_with_cancel(
++            0,
++            NativeElement::for_test("invalid-target"),
++            Arc::new(AtomicBool::new(true)),
++        )
++        .unwrap_err();
++        assert_eq!(error.to_string(), "cancelled_before_delivery");
+     }
+ 
+     #[test]
+--- a/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/browser_consent_ui.rs
+@@ -17,7 +17,7 @@
+         node.name.as_deref(),
+         node.value
+             .as_deref()
+-            .filter(|_| node.text.value_complete && !node.text.protected),
++            .filter(|_| node.text.value_complete && node.text.protected == Some(false)),
+         node.description.as_deref(),
+     ]
+     .into_iter()
+--- a/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/browser_setup_ui.rs
+@@ -22,7 +22,7 @@
+         node.name.as_deref(),
+         node.value
+             .as_deref()
+-            .filter(|_| node.text.value_complete && !node.text.protected),
++            .filter(|_| node.text.value_complete && node.text.protected == Some(false)),
+         node.description.as_deref(),
+     ]
+     .into_iter()
+@@ -53,7 +53,7 @@
+             && node
+                 .value
+                 .as_deref()
+-                .filter(|_| node.text.value_complete && !node.text.protected)
++                .filter(|_| node.text.value_complete && node.text.protected == Some(false))
+                 .or(node.name.as_deref())
+                 .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+     });
+@@ -168,7 +168,7 @@
+ fn omnibox_holds_setup_url(node: &AtspiNode, descriptor: &BrowserSetupDescriptor) -> bool {
+     node.value
+         .as_deref()
+-        .filter(|_| node.text.value_complete && !node.text.protected)
++        .filter(|_| node.text.value_complete && node.text.protected == Some(false))
+         .or(node.name.as_deref())
+         .is_some_and(|value| value.trim().eq_ignore_ascii_case(descriptor.setup_url))
+ }
+@@ -697,6 +697,7 @@
+             description: None,
+             text: crate::atspi::NativeTextObservation {
+                 value_complete: value.is_some(),
++                protected: Some(false),
+                 ..Default::default()
+             },
+             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
+@@ -773,7 +774,12 @@
+ 
+     #[test]
+     fn incomplete_omnibox_value_cannot_prove_the_setup_url() {
+-        let mut candidate = node("entry", "Address and search bar", Some(descriptor().setup_url), &[]);
++        let mut candidate = node(
++            "entry",
++            "Address and search bar",
++            Some(descriptor().setup_url),
++            &[],
++        );
+         assert!(omnibox_holds_setup_url(&candidate, descriptor()));
+         candidate.text.value_complete = false;
+         assert!(!omnibox_holds_setup_url(&candidate, descriptor()));
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+@@ -603,7 +603,7 @@
+             entry["accessible_name"] = json!(name);
+         }
+         let field = n.text.editable == Some(true)
+-            || n.text.protected
++            || n.text.protected == Some(true)
+             || n.text.value_source.as_deref() == Some("atspi.Text.GetText")
+             || matches!(
+                 n.role.as_str(),
+@@ -617,7 +617,7 @@
+     if let Some(description) = &n.description {
+         entry["description"] = json!(description);
+     }
+-    if let Some(value) = n.value.as_ref().filter(|_| !n.text.protected) {
++    if let Some(value) = n.value.as_ref().filter(|_| n.text.protected == Some(false)) {
+         entry["value"] = json!(value);
+     }
+     if let Value::Object(metadata) = serde_json::to_value(&n.text).expect("native text metadata") {
+@@ -687,7 +687,9 @@
+                 per indexed row with `element_index`, `role`, `label`, `value`, \
+                 `accessible_name`, native `editable` when known, `value_complete`, \
+                 `value_status`, `protected`, and text/label provenance. Empty readable \
+-                values are preserved as empty strings. `placeholder` and `description` \
++                values are preserved as empty strings. `protected` is true, false, or null \
++                (unknown); protected/unknown values are omitted. `native_attributes` \
++                contains only native identification attributes. `placeholder` and `description` \
+                 are separate; `input_type` is included only from native attributes, \
+                 with `input_type_status` explaining missing evidence. \
+                 `enabled`, `selected`, `actions` (names of AT-SPI actions exposed \
+@@ -1203,6 +1205,7 @@
+         n.value = Some(String::new());
+         n.description = Some("Choose a query".into());
+         n.text.editable = Some(true);
++        n.text.protected = Some(false);
+         n.text.name_source = "atspi.name-from:attribute".into();
+         n.text.value_complete = true;
+         n.text.value_status = "complete".into();
+@@ -1225,6 +1228,7 @@
+         let mut n = node(Vec::new());
+         n.role = "combo box".into();
+         n.text.editable = Some(true);
++        n.text.protected = Some(false);
+         n.value = Some("Deep House".into());
+         n.description = Some("Query description".into());
+         for (name, source) in [
+@@ -1245,7 +1249,7 @@
+     fn protected_and_failed_values_do_not_look_like_complete_empty_fields() {
+         let mut n = node(Vec::new());
+         n.value = Some("should never escape".into());
+-        n.text.protected = true;
++        n.text.protected = Some(true);
+         n.text.value_complete = false;
+         n.text.value_status = "protected".into();
+         let entry = build_element_entry(&n, None, None).unwrap();
+@@ -1253,10 +1257,22 @@
+         assert_eq!(entry["value_complete"], false);
+         assert_eq!(entry["value_status"], "protected");
+         n.value = None;
+-        n.text.protected = false;
++        n.text.protected = Some(false);
+         n.text.value_status = "read_failure".into();
+         let entry = build_element_entry(&n, None, None).unwrap();
+         assert!(entry.get("value").is_none());
++        assert_eq!(entry["value_complete"], false);
++    }
++    #[test]
++    fn unknown_protection_is_explicit_and_never_publishes_a_value() {
++        let mut n = node(Vec::new());
++        n.role = "entry".into();
++        n.value = Some("not safe to publish".into());
++        n.text.value_status = "protection_unknown".into();
++        let entry = build_element_entry(&n, None, None).unwrap();
++        assert!(entry.get("value").is_none());
++        assert!(entry["protected"].is_null());
++        assert_eq!(entry["protection_source"], "unavailable");
+         assert_eq!(entry["value_complete"], false);
+     }
+ }
+@@ -3614,27 +3630,38 @@
+                 );
+             }
+             if element_click_prefers_ax(foreground_hyprland, button, count, !modifiers.is_empty()) {
++                let cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
++                let _cancel_on_drop = CancelNativeValueOnDrop(cancellation.clone());
++                let lifecycle = match retain_native_value_lifecycle(&args) {
++                    Ok(guard) => guard,
++                    Err(error) => {
++                        return native_activation_result(
++                            Err(anyhow::anyhow!(error)),
++                            foreground_hyprland,
++                        )
++                    }
++                };
+                 let ax_result = tokio::task::spawn_blocking({
+                     let idx = idx.clone();
+-                    move || crate::atspi::perform_action(pid, idx.clone())
++                    move || {
++                        let _lifecycle = lifecycle;
++                        crate::atspi::perform_action_with_cancel(pid, idx, cancellation)
++                    }
+                 })
+                 .await;
+-                if let Ok(Ok((_action, suspected_noop))) = ax_result {
+-                    let mut structured = json!({
+-                        "path": "ax",
+-                        "verified": false,
+-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
++                let result = ax_result.unwrap_or_else(|_| Err(anyhow::anyhow!(
++                    "outcome_uncertain: native activation worker did not return; refresh before another action"
++                )));
++                // Preserve the existing background Component-only route only
++                // after native code positively proves no Action was available
++                // or attempted. Advertised select targets never get this marker.
++                let component_fallback = !foreground_hyprland
++                    && result.as_ref().err().is_some_and(|e| {
++                        e.to_string()
++                            .starts_with("native_coordinate_fallback_safe:")
+                     });
+-                    if suspected_noop {
+-                        structured["escalation"] = non_ax_escalation();
+-                    }
+-                    return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
+-                        .with_structured(structured);
+-                }
+-                // AT-SPI errors can arrive after dispatch. Do not introduce a
+-                // primary-seat replay when its semantic outcome is uncertain.
+-                if foreground_hyprland {
+-                    return foreground_ax_click_unknown(pid, idx.index());
++                if !component_fallback {
++                    return native_activation_result(result, foreground_hyprland);
+                 }
+             }
+             if foreground_hyprland {
+@@ -3869,10 +3896,26 @@
+                     crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
+                 })
+                 .await;
+-                if matches!(semantic, Ok(Ok(Some(_)))) {
+-                    return ToolResult::text("Dispatched AT-SPI click.").with_structured(json!({
+-                        "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
+-                    }));
++                match semantic {
++                    Ok(Ok(Some(_))) => {
++                        return ToolResult::text("Dispatched AT-SPI click.").with_structured(
++                            json!({
++                                "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
++                            }),
++                        )
++                    }
++                    Ok(Err(error)) if error.to_string().starts_with("outcome_uncertain:") => {
++                        return native_activation_result(Err(error), false)
++                    }
++                    Err(_) => {
++                        return native_activation_result(
++                            Err(anyhow::anyhow!(
++                                "outcome_uncertain: native hit-test worker failed"
++                            )),
++                            false,
++                        )
++                    }
++                    Ok(Ok(None)) | Ok(Err(_)) => {}
+                 }
+             }
+             return isolated_hyprland_action(
+@@ -3910,10 +3953,14 @@
+                     // working. (x,y) are screen coords here, matching the frames in
+                     // `get_window_state`. Miss → fall through to the injection paths.
+                     if !delivery.is_foreground() && button == 1 && count == 1 {
+-                        if let Ok(Some(_)) = crate::atspi::perform_action_at_screen_point(
++                        match crate::atspi::perform_action_at_screen_point(
+                             pid, xid, output_x, output_y,
+                         ) {
+-                            return Ok("wayland_atspi");
++                            Ok(Some(_)) => return Ok("wayland_atspi"),
++                            Err(error) if error.to_string().starts_with("outcome_uncertain:") => {
++                                return Err(error)
++                            }
++                            _ => {}
+                         }
+                     }
+                     if crate::wayland::is_inject_mode() {
+@@ -3940,9 +3987,12 @@
+                 // click (the agent's escalation when background didn't land).
+                 let inject = |fg: bool| -> anyhow::Result<&'static str> {
+                     if !fg && button == 1 && count == 1 && modifiers_for_task.is_empty() {
+-                        if let Ok(Some(_)) = crate::atspi::perform_action_at_point(pid, xid, xi, yi)
+-                        {
+-                            return Ok("x11_atspi");
++                        match crate::atspi::perform_action_at_point(pid, xid, xi, yi) {
++                            Ok(Some(_)) => return Ok("x11_atspi"),
++                            Err(error) if error.to_string().starts_with("outcome_uncertain:") => {
++                                return Err(error)
++                            }
++                            _ => {}
+                         }
+                     }
+                     if fg {
+@@ -5699,6 +5749,66 @@
+     .map_err(str::to_owned)
+ }
+ 
++fn native_activation_result(
++    result: anyhow::Result<crate::atspi::NativeActivationOutcome>,
++    foreground: bool,
++) -> ToolResult {
++    use cua_driver_core::action_record::{
++        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
++        EvidenceKind, RequestedDelivery,
++    };
++    let (effect, detail, delivery, failed) = match result {
++        Ok(outcome) => match outcome.selection {
++            Some(selection) if selection.selected == Some(true) => (ActionEffect::Confirmed,
++                "atspi.Action.select: the exact retained result is Selected on fresh native readback.".to_owned(),
++                Some(ActualDelivery::Background), false),
++            Some(selection) => (ActionEffect::Unverifiable,
++                format!("atspi.Action.select was acknowledged, but selection is {}; refresh state before another action.", selection.status),
++                Some(ActualDelivery::Background), true),
++            None => (if outcome.suspected_noop { ActionEffect::SuspectedNoop } else { ActionEffect::Unverifiable },
++                format!("Native {} was acknowledged; its final effect is not verified.", outcome.action),
++                Some(ActualDelivery::Background), false),
++        },
++        Err(error) => {
++            let uncertain = error.to_string().starts_with("outcome_uncertain:");
++            (if uncertain {ActionEffect::Unverifiable} else {ActionEffect::Refused}, error.to_string(),
++                uncertain.then_some(ActualDelivery::Unknown), true)
++        }
++    };
++    let mut record = ActionExecutionRecord::builder(
++        effect,
++        ActionTransport::LinuxAtSpiAction,
++        if foreground {
++            RequestedDelivery::Foreground
++        } else {
++            RequestedDelivery::Background
++        },
++    )
++    .detail(detail.clone());
++    if let Some(delivery) = delivery {
++        record = record.actual_delivery(delivery);
++    }
++    if effect == ActionEffect::Confirmed {
++        record = record.evidence(ActionEvidence { kind: EvidenceKind::AccessibilityReadback,
++            detail: "Selected state was read independently from the same live, window-bound native result.".into() });
++    }
++    let record = record.build().expect("native activation action record");
++    let structured = serde_json::to_value(
++        record
++            .public_result()
++            .expect("native activation projection"),
++    )
++    .expect("native activation JSON");
++    let result = if failed {
++        ToolResult::error(detail)
++    } else {
++        ToolResult::text(detail)
++    };
++    result
++        .with_structured(structured)
++        .with_action_record(record)
++}
++
+ fn native_set_value_result(result: anyhow::Result<crate::atspi::SetValueOutcome>) -> ToolResult {
+     use cua_driver_core::action_record::{
+         ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+@@ -5750,6 +5860,42 @@
+ #[cfg(test)]
+ mod native_value_result_tests {
+     use super::*;
++
++    #[test]
++    fn selection_only_confirms_independent_selected_readback() {
++        for selected in [Some(true), Some(false), None] {
++            let result = native_activation_result(
++                Ok(crate::atspi::NativeActivationOutcome {
++                    action: "select".into(),
++                    suspected_noop: false,
++                    selection: Some(crate::atspi::NativeSelectionOutcome {
++                        selected,
++                        status: "readback_unavailable",
++                    }),
++                }),
++                false,
++            );
++            assert_eq!(
++                result.structured_content.unwrap()["effect"],
++                if selected == Some(true) {
++                    "confirmed"
++                } else {
++                    "unverifiable"
++                }
++            );
++            assert_eq!(result.is_error == Some(true), selected != Some(true));
++        }
++        let refused = native_activation_result(Err(anyhow::anyhow!("unsupported")), false);
++        assert_eq!(refused.is_error, Some(true));
++        assert_eq!(refused.structured_content.unwrap()["effect"], "refused");
++        let uncertain =
++            native_activation_result(Err(anyhow::anyhow!("outcome_uncertain: dispatch")), false);
++        assert_eq!(uncertain.is_error, Some(true));
++        assert_eq!(
++            uncertain.structured_content.unwrap()["effect"],
++            "unverifiable"
++        );
++    }
+ 
+     #[test]
+     fn replacement_outcomes_distinguish_proof_refusal_and_uncertainty() {

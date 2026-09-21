@@ -1,12 +1,10 @@
 # Maintainer: Spencer Bull <spencerbull2554@gmail.com>
 
-# Rebuild the CLI and SDK with the patches described in PATCHES.md; retain
-# companion assets from the matching vendor tarball. Upstream keeps the CLI, its cursor-theme
-# compiler, and the SDK artifacts together in one directory and exposes the
-# CLI through a symlink -- the binary resolves its helpers as siblings of
-# /proc/self/exe -- so the whole tree lands under /usr/lib/cua-driver with a
-# /usr/bin symlink. Automatic updates are held in .omarchy/package.json until
-# the source checksum and patches are requalified for a new release.
+# This local experiment rebuilds the CLI and SDK from checksummed upstream
+# source with the patches below, retaining the matching vendor companion assets.
+# The binary resolves helpers beside /proc/self/exe, so the complete vendor
+# layout stays under /usr/lib/cua-driver with a /usr/bin symlink. Automatic
+# upstream synchronization is held with sync:false until this stack is qualified.
 #
 # The binary carries its own updater: `cua-driver update --apply` pipes the
 # vendor installer into bash, which would install a second copy under
@@ -14,12 +12,12 @@
 # this repository's release gate. Driver 0.27.0 detects pacman ownership, but
 # deliberately treats failed and timed-out ownership queries as unmanaged.
 # A /usr/bin wrapper would not cover MCP configurations that record the
-# resolved executable, so _contain_updater() rewrites the installer URL inside the
+# resolved executable, so build() rewrites the installer URL inside the
 # binary to point at pm.sh, a stand-in that declines and names pacman instead.
 
 pkgname=cua-driver-bin
 pkgver=0.28.2
-pkgrel=1.3
+pkgrel=1.6
 pkgdesc="Computer-use driver for native GUI apps: accessibility-tree snapshots and input injection"
 arch=('x86_64') # Local proof only; ARM has not been built or tested.
 url="https://github.com/trycua/cua"
@@ -43,14 +41,18 @@ conflicts=('cua-driver')
 # makepkg's GCC LTO objects in ring/zstd cannot be consumed by Rust's lld.
 options=('!strip' '!debug' '!lto')
 # Local experiment: compile the patched CLI and SDK from the exact release tag,
-# retaining the release's companion assets. No plugin changes.
+# retaining the release's companion assets. Explicit Chromium foreground text
+# additionally requires the separately patched local Hyprland plugin.
 _source_tree="cua-cua-driver-rs-v${pkgver}"
 source=('LICENSE' 'pm.sh'
         "cua-source-${pkgver}.tar.gz::https://codeload.github.com/trycua/cua/tar.gz/refs/tags/cua-driver-rs-v${pkgver}"
         'chromium-accessibility.patch'
         'exact-window-snapshots.patch'
         'hyprland-unusable-geometry.patch'
-        'editable-text-contract.patch')
+        'editable-text-contract.patch'
+        'native-selection-protection.patch'
+        'chromium-foreground-replacement.patch'
+        'replacement-failure-diagnostics.patch')
 source_x86_64=("https://github.com/trycua/cua/releases/download/cua-driver-rs-v${pkgver}/cua-driver-rs-${pkgver}-linux-x86_64.tar.gz")
 source_aarch64=("https://github.com/trycua/cua/releases/download/cua-driver-rs-v${pkgver}/cua-driver-rs-${pkgver}-linux-arm64.tar.gz")
 sha256sums=('c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9'
@@ -59,7 +61,10 @@ sha256sums=('c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9'
             'dfdf923fa28cac2b85b34e9141bc7094a08176ec77fdfe75251fcf6fc2767f1a'
             '0a3afc3879197d4921e64cf34740a17a21ccd8eda371ed89e5f36da513f2912f'
             '81d87d415ad6b5d9f736432afb430b6ef74c82511e3d56c0215274f1e50eb84c'
-            'f7afa1497cc6452c6394b592144f87b9db5363409693bea08ce941181f970568')
+            'f7afa1497cc6452c6394b592144f87b9db5363409693bea08ce941181f970568'
+            'c0146ae2f78114a4d65e600ab38f56848e5cc4ee347cdfc0d9c574706283a018'
+            '35864c30e19d6b79f9c34d884ffb9dcce691d101a7453244a8c6eaf01efceb1f'
+            '614ab7c1a8e58cc0c277b34d86fd930f5a3b9e120012a6bce22f7255e12779bf')
 sha256sums_x86_64=('8f3e5b669e2bcd98d0eecc64f40640aac77f358b6332a06abc6ee79991620f7d')
 sha256sums_aarch64=('cadd7e6b757c3ce50f2b5f6e273c154ea48450fb5fcaff744209b382915eddf5')
 
@@ -81,6 +86,9 @@ prepare() {
   patch -Np1 -i "${srcdir}/exact-window-snapshots.patch"
   patch -Np1 -i "${srcdir}/hyprland-unusable-geometry.patch"
   patch -Np1 -i "${srcdir}/editable-text-contract.patch"
+  patch -Np1 -i "${srcdir}/native-selection-protection.patch"
+  patch -Np1 -i "${srcdir}/chromium-foreground-replacement.patch"
+  patch -Np1 -i "${srcdir}/replacement-failure-diagnostics.patch"
 }
 
 build() {
@@ -94,6 +102,8 @@ build() {
 
 check() {
   cd "${srcdir}/${_source_tree}/libs/cua-driver/rust"
+  cargo test --locked -p cua-driver-contract
+  cargo test --locked -p platform-linux --lib wayland::hyprland_input::tests
   cargo test --locked -p platform-linux --lib atspi::
   cargo test --locked -p platform-linux --lib wayland::hyprland::tests
   cargo test --locked -p platform-linux --lib character_typing_never_ignores_an_element_target
@@ -101,6 +111,9 @@ check() {
   cargo test --locked -p platform-linux --lib native_value_result_tests
   cargo test --locked -p platform-linux --lib browser_setup_ui::
   cargo test --locked -p platform-linux --lib browser_consent_ui::
+  cargo test --locked -p cua-driver-core --lib delivery_mode
+  CUA_TEST_DRIVER_BIN="${srcdir}/${_vendor_tree}/cua-driver" cargo test --locked -p cua-driver --test protocol_schema_test --test protocol_element_token_test
+  env -u NO_AT_BRIDGE -u AT_SPI_BUS_ADDRESS cargo test --locked -p cua-driver --test atspi_listener_startup_test
   cargo test --locked -p cua-driver-core --lib expectation::
   cargo test --locked -p cua-driver-core --test snapshot_invariants --test snapshot_dispatch_invariants --test session_lifecycle
 }
@@ -147,7 +160,7 @@ package() {
   cp -a . "${pkgdir}/usr/lib/cua-driver/"
   chmod -R a+rX "${pkgdir}/usr/lib/cua-driver"
 
-  # The path _contain_updater() wrote into the binary.
+  # The path _contain_updater wrote into the rebuilt binary.
   install -Dm755 "${srcdir}/pm.sh" "${pkgdir}/usr/lib/cua-driver/pm.sh"
 
   install -d "${pkgdir}/usr/bin"

@@ -1,0 +1,513 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -45,6 +45,13 @@
+ endif()
+ 
+ if(BUILD_TESTING)
++    add_executable(cua_hyprland_unicode_text_test tests/unicode_text_test.cpp)
++    target_compile_features(cua_hyprland_unicode_text_test PRIVATE cxx_std_26)
++    target_include_directories(cua_hyprland_unicode_text_test PRIVATE src)
++    target_link_libraries(cua_hyprland_unicode_text_test PRIVATE PkgConfig::XKBCOMMON)
++    target_compile_options(cua_hyprland_unicode_text_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
++    add_test(NAME cua_hyprland_unicode_text_test COMMAND cua_hyprland_unicode_text_test)
++
+     add_executable(cua_hyprland_keyboard_layout_test tests/keyboard_layout_test.cpp)
+     target_compile_features(cua_hyprland_keyboard_layout_test PRIVATE cxx_std_26)
+     target_include_directories(cua_hyprland_keyboard_layout_test PRIVATE src)
+@@ -53,6 +60,11 @@
+     add_test(NAME cua_hyprland_keyboard_layout_test COMMAND cua_hyprland_keyboard_layout_test)
+ 
+     find_package(Python3 REQUIRED COMPONENTS Interpreter)
++    add_test(NAME cua_hyprland_unicode_dispatch_test
++        COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/unicode_dispatch_test.py)
++    set_tests_properties(cua_hyprland_unicode_dispatch_test PROPERTIES
++        ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}")
++
+     add_test(NAME cua_hyprland_agent_keymap_test
+         COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/tests/agent_keymap_test.py)
+     set_tests_properties(cua_hyprland_agent_keymap_test PROPERTIES
+--- a/src/input_experiment.cpp
++++ b/src/input_experiment.cpp
+@@ -10,6 +10,7 @@
+ #include "owned_socket_path.hpp"
+ #include "foreground_route.hpp"
+ #include "keyboard_layout.hpp"
++#include "unicode_text.hpp"
+ #include <sys/mman.h>
+ 
+ #include <src/Compositor.hpp>
+@@ -148,6 +149,29 @@
+ std::string refusal(std::string_view code, ForegroundFailure failure) {
+     return std::format(R"({{"ok":false,"code":"{}","detail":"{}"}})", code, failure.detail());
+ }
++// This carrier is never registered with Hyprland or assigned to a seat. It
++// provides only a sealed map for CWLKeyboardResource::sendKeymap, avoiding any
++// global keyboard state mutation or access to private protocol internals.
++class UnicodeKeyboard final : public IKeyboard {
++  public:
++    explicit UnicodeKeyboard(const std::string& map) {
++        m_xkbKeymapV1String = map;
++        m_xkbKeymapV1FD = Hyprutils::OS::CFileDescriptor(
++            memfd_create("cua-unicode-keymap", MFD_CLOEXEC | MFD_ALLOW_SEALING));
++        if (!m_xkbKeymapV1FD.isValid()) throw std::runtime_error("Unicode map fd unavailable");
++        std::size_t offset = 0;
++        while (offset < map.size() + 1) {
++            const auto n = write(m_xkbKeymapV1FD.get(), map.c_str() + offset, map.size() + 1 - offset);
++            if (n < 0 && errno == EINTR) continue;
++            if (n <= 0) throw std::runtime_error("Unicode map write failed");
++            offset += static_cast<std::size_t>(n);
++        }
++        if (fcntl(m_xkbKeymapV1FD.get(), F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL) < 0)
++            throw std::runtime_error("Unicode map sealing failed");
++    }
++    bool isVirtual() override { return true; }
++    SP<Aquamarine::IKeyboard> aq() override { return {}; }
++};
+ constexpr auto kDelivered = R"({"ok":true,"effect":"unverifiable","route":"synthetic_events"})";
+ constexpr auto kForegroundDelivered = R"({"ok":true,"effect":"unverifiable","route":"primary_foreground"})";
+ } // namespace
+@@ -167,6 +191,8 @@
+         bool has_bound_target = false;
+         InputRoute route = InputRoute::unbound;
+         bool foreground_attempted = false;
++        bool unicode_prepared = false;
++        std::map<std::uint32_t, SP<IKeyboard>> unicode_maps;
+         std::string challenge, token;
+         WP<Desktop::View::CWindow> window;
+         WP<CWLSurfaceResource> surface;
+@@ -534,6 +560,7 @@
+     void invalidate(Client& c, bool clear_pointer = true) {
+         if (lease == &c || (clear_pointer && c.surface.lock() && pointer_target.surface() == c.surface.lock()))
+             revoke("stale_target", !clear_pointer);
++        c.unicode_prepared = false; c.unicode_maps.clear();
+         c.token.clear(); c.window.reset(); c.surface.reset();
+         // Replay high-water belongs to the old target binding. A genuinely
+         // new token may receive a shorter grant after Stop or target change.
+@@ -1020,7 +1047,7 @@
+             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
+             c.hello = true;
+             if (kProduction)
+-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true}})", epoch));
++                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"foreground_unicode_scalar":true,"foreground_unicode_max":65535}})", epoch));
+             else
+                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
+             return;
+@@ -1056,6 +1083,30 @@
+         if (command == "APPROVE") { approve(c, f); return; }
+ #endif
+         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
++        if (command == "TEXT_PREPARE") {
++            c.unicode_prepared = false; c.unicode_maps.clear();
++            if (!kProduction || c.route != InputRoute::primary_foreground || f.size() != 4) {
++                send(c, refusal("unsupported")); return;
++            }
++            if (c.token.empty() || f[1] != c.token || !refresh(c) || number(f[2]) != c.revision) {
++                send(c, refusal("stale_target")); return;
++            }
++            if (!available() || !physical_layout_ready() || c.dead) {
++                send(c, refusal("session_unavailable")); return;
++            }
++            // Preflight may run before activation. Require a live admitted
++            // target, but never focus it or consume input permission here.
++            if (lease != &c || !grant.permits(2, Clock::now())) {
++                send(c, refusal("action_not_admitted")); return;
++            }
++            std::map<std::uint32_t, SP<IKeyboard>> prepared;
++            for (const auto& [scalar, map] : prepare_unicode_maps(f[3]))
++                prepared.emplace(scalar, makeShared<UnicodeKeyboard>(map));
++            c.unicode_maps = std::move(prepared);
++            c.unicode_prepared = true;
++            send(c, std::format(R"({{"ok":true,"prepared_count":{}}})", c.unicode_maps.size()));
++            return;
++        }
+         if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
+             if (drag) { send(c, refusal("invalid_request")); return; }
+             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
+@@ -1120,9 +1171,12 @@
+             }
+             send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{}}})", c.token, c.revision, c.geometry[2], c.geometry[3])); return;
+         }
+-        const std::uint64_t cap = command == "CLICK" ? 1 : command == "KEY" ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
++        const bool unicode_command = (command == "UNICODE" || command == "TEXT_BACKSPACE") &&
++            kProduction && c.route == InputRoute::primary_foreground;
++        const std::uint64_t cap = command == "CLICK" ? 1 : (command == "KEY" || unicode_command) ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
+             command == "ACTIVATE" && kProduction && c.route == InputRoute::primary_foreground ? 16 : 0;
+-        const std::size_t count = command == "CLICK" ? 8 : command == "KEY" ? 6 : command == "SCROLL" ? 8 : command == "ACTIVATE" ? 4 : 9;
++        const std::size_t count = command == "UNICODE" ? 5 : command == "TEXT_BACKSPACE" ? 4 :
++            command == "CLICK" ? 8 : command == "KEY" ? 6 : command == "SCROLL" ? 8 : command == "ACTIVATE" ? 4 : 9;
+         if (!cap) { send(c, refusal("unsupported")); return; }
+         if (f.size() != count) { send(c, refusal("invalid_request")); return; }
+         const auto sequence = number(f[1]);
+@@ -1201,8 +1255,76 @@
+         if (kProduction) complete_action();
+         send(c, kDelivered);
+     }
++    void foreground_text(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
++        if (!c.unicode_prepared) { send(c, refusal("text_not_prepared")); return; }
++        const bool erase = f[0] == "TEXT_BACKSPACE";
++        SP<IKeyboard> prepared;
++        if (!erase) {
++            const auto scalar = number(f[4], 16);
++            if (scalar > kMaxForegroundUnicodeScalar || !c.unicode_maps.contains(static_cast<std::uint32_t>(scalar))) {
++                send(c, refusal("text_not_prepared")); return;
++            }
++            prepared = c.unicode_maps.at(static_cast<std::uint32_t>(scalar));
++        }
++        // Text is never an activation request. Refuse a focus change before
++        // start_foreground can activate anything, on the compositor thread.
++        const auto failure = foreground_guard(c).dispatch_failure(false);
++        if (failure != ForegroundFailureReason::none) throw ForegroundFailure{failure};
++        const auto modifiers = capture_foreground_modifiers(true);
++        if (erase && !foreground_chord_compatible(physical_keymap, keymap, 14, 0, modifiers)) {
++            send(c, refusal("unsupported_layout")); return;
++        }
++        const auto original_keyboard = g_pSeatManager->m_keyboard.lock();
++        if (!original_keyboard) throw ForegroundFailure{ForegroundFailureReason::physical_keyboard};
++        if (!consume_grant(c, cap)) return;
++        start_foreground(c, 0, 0, false, true, modifiers);
++        if (erase) {
++            foreground_key(c, 14, true); foreground_key(c, 14, false);
++        } else {
++            std::vector<SP<CWLKeyboardResource>> resources;
++            for (const auto& weak : foreground_keyboards) {
++                const auto k = weak.lock();
++                if (!k || !k->good()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
++                resources.push_back(k);
++            }
++            with_unicode_keymaps(resources.size(),
++                [&](std::size_t i) {
++                    require_foreground(c);
++                    resources[i]->sendKeymap(prepared);
++                    resources[i]->sendMods(0, 0, 0, 0);
++                },
++                [&] {
++                    require_foreground(c);
++                    held_keys.push_back(kUnicodeEvdevCode);
++                    for (const auto& k : resources) {
++                        require_foreground(c);
++                        if (!k->good()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
++                        k->sendKey(event_ms(), kUnicodeEvdevCode, WL_KEYBOARD_KEY_STATE_PRESSED);
++                    }
++                    for (const auto& k : resources) {
++                        require_foreground(c);
++                        if (!k->good()) throw ForegroundFailure{ForegroundFailureReason::keyboard_resources};
++                        k->sendKey(event_ms(), kUnicodeEvdevCode, WL_KEYBOARD_KEY_STATE_RELEASED);
++                    }
++                    std::erase(held_keys, kUnicodeEvdevCode);
++                },
++                [&](std::size_t i) {
++                    // Configuration restoration addresses only the original
++                    // captured resources, even if input/focus was cancelled.
++                    // A destroyed resource cannot retain a temporary keymap.
++                    if (!resources[i]->good()) return;
++                    resources[i]->sendKeymap(original_keyboard);
++                    resources[i]->sendMods(modifiers[0], modifiers[1], modifiers[2], modifiers[3]);
++                });
++        }
++        require_foreground(c);
++        ++dispatches;
++        complete_action();
++        send(c, kForegroundDelivered);
++    }
+     void foreground_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
+         const auto& command = f[0];
++        if (command == "UNICODE" || command == "TEXT_BACKSPACE") { foreground_text(c, f, cap); return; }
+         double x = c.geometry[2] / 2, y = c.geometry[3] / 2, x2 = 0, y2 = 0, value = 0;
+         std::uint64_t code = 0, mods = 0, clicks = 0, axis = 0, duration = 0;
+         if (command == "KEY") {
+--- /dev/null
++++ b/src/unicode_text.hpp
+@@ -0,0 +1,92 @@
++#pragma once
++
++#include <xkbcommon/xkbcommon.h>
++#include <charconv>
++#include <cstdint>
++#include <cstdlib>
++#include <exception>
++#include <format>
++#include <map>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <string_view>
++
++namespace cua::hyprland {
++constexpr std::uint32_t kUnicodeEvdevCode = 30;
++constexpr std::size_t kMaxUnicodeScalars = 128;
++// Chromium truncates supplementary-plane key events to 16 bits on this route.
++// Reject them before any field selection or editing.
++constexpr std::uint32_t kMaxForegroundUnicodeScalar = 0xffff;
++
++inline bool printable_unicode_scalar(std::uint32_t scalar) {
++    return scalar >= 0x20 && scalar <= kMaxForegroundUnicodeScalar && !(scalar >= 0x7f && scalar <= 0x9f) &&
++        !(scalar >= 0xd800 && scalar <= 0xdfff) && scalar != 0x2028 && scalar != 0x2029;
++}
++
++inline std::string unicode_scalar_keymap(std::uint32_t scalar) {
++    if (!printable_unicode_scalar(scalar)) throw std::runtime_error("unsupported Unicode scalar");
++    const auto source = std::format(R"(xkb_keymap {{
++ xkb_keycodes {{ minimum=8; maximum=255; <CUAT>=38; }};
++ xkb_types {{ type "ONE_LEVEL" {{ modifiers=None; map[None]=Level1; }}; }};
++ xkb_compatibility {{ }};
++ xkb_symbols {{ key <CUAT> {{ type="ONE_LEVEL", [ U{:04X} ] }}; }};
++}};)", scalar);
++    const auto context = std::unique_ptr<xkb_context, decltype(&xkb_context_unref)>(
++        xkb_context_new(XKB_CONTEXT_NO_ENVIRONMENT_NAMES), xkb_context_unref);
++    if (!context) throw std::runtime_error("Unicode XKB context unavailable");
++    const auto map = std::unique_ptr<xkb_keymap, decltype(&xkb_keymap_unref)>(
++        xkb_keymap_new_from_string(context.get(), source.c_str(), XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS), xkb_keymap_unref);
++    const auto state = std::unique_ptr<xkb_state, decltype(&xkb_state_unref)>(
++        map ? xkb_state_new(map.get()) : nullptr, xkb_state_unref);
++    if (!state || xkb_state_key_get_utf32(state.get(), kUnicodeEvdevCode + 8) != scalar)
++        throw std::runtime_error("Unicode scalar failed XKB preflight");
++    const auto serialized = std::unique_ptr<char, decltype(&std::free)>(
++        xkb_keymap_get_as_string(map.get(), XKB_KEYMAP_FORMAT_TEXT_V1), std::free);
++    if (!serialized) throw std::runtime_error("Unicode XKB serialization unavailable");
++    return serialized.get();
++}
++
++inline std::map<std::uint32_t, std::string> prepare_unicode_maps(std::string_view input) {
++    std::map<std::uint32_t, std::string> result;
++    if (input == "-") return result;
++    while (!input.empty()) {
++        const auto comma = input.find(',');
++        const auto part = input.substr(0, comma);
++        std::uint32_t scalar = 0;
++        const auto [end, error] = std::from_chars(part.data(), part.data() + part.size(), scalar, 16);
++        if (part.empty() || error != std::errc{} || end != part.data() + part.size())
++            throw std::runtime_error("invalid Unicode scalar list");
++        if (!result.contains(scalar)) {
++            if (result.size() >= kMaxUnicodeScalars) throw std::runtime_error("too many Unicode scalars");
++            result.emplace(scalar, unicode_scalar_keymap(scalar));
++        }
++        if (comma == std::string_view::npos) return result;
++        input.remove_prefix(comma + 1);
++        if (input.empty()) throw std::runtime_error("invalid Unicode scalar list");
++    }
++    throw std::runtime_error("empty Unicode scalar list requires dash");
++}
++
++// Restore every possibly modified resource, including when install or dispatch
++// fails. The callbacks own exact-resource and focus guards; no global keymap is
++// changed. Restoration failure is always uncertain and cannot become a retry.
++template <typename Install, typename Dispatch, typename Restore>
++void with_unicode_keymaps(std::size_t resource_count, Install install, Dispatch dispatch, Restore restore) {
++    std::size_t touched = 0;
++    std::exception_ptr failure;
++    try {
++        for (std::size_t i = 0; i < resource_count; ++i) {
++            touched = i + 1;
++            install(i);
++        }
++        dispatch();
++    } catch (...) { failure = std::current_exception(); }
++    bool restore_failed = false;
++    for (std::size_t i = 0; i < touched; ++i) {
++        try { restore(i); } catch (...) { restore_failed = true; }
++    }
++    if (restore_failed) throw std::runtime_error("Unicode keymap restoration uncertain");
++    if (failure) std::rethrow_exception(failure);
++}
++} // namespace cua::hyprland
+--- a/tests/desktop_fault_policy_fixture.cpp
++++ b/tests/desktop_fault_policy_fixture.cpp
+@@ -21,6 +21,8 @@
+ struct Client {
+     InputRoute route = InputRoute::independent;
+     bool dead = false;
++    bool unicode_prepared = true;
++    std::vector<unsigned> unicode_maps{0x1f98a};
+     void* source = nullptr;
+     int fd = -1;
+     std::string token = "old-target";
+@@ -109,6 +111,11 @@
+ };
+ 
+ int main() {
++    { Lane l; auto& client=*l.clients.front(); l.invalidate(client);
++      check(!client.unicode_prepared && client.unicode_maps.empty(), "target invalidation retained prepared Unicode"); }
++    { Lane l; l.cancel_authority("cancelled");
++      check(!l.clients.front()->unicode_prepared && l.clients.front()->unicode_maps.empty(), "cancellation retained prepared Unicode"); }
++
+     { Lane l; l.suspend(); l.guard_targets(); l.check_inert();
+       check(!l.reservation && l.clients.empty() && !l.available(), "disable retained admission"); }
+     { Lane l; l.suspend("plugin_shutdown"); l.guard_targets(); l.check_inert(false); }
+--- /dev/null
++++ b/tests/unicode_dispatch_test.py
+@@ -0,0 +1,137 @@
++"""Run the actual foreground_text method against exact-resource/XKB doubles."""
++import os
++from pathlib import Path
++import re
++import shlex
++import subprocess
++import tempfile
++import unittest
++
++ROOT = Path(__file__).resolve().parents[1]
++
++
++class UnicodeDispatchTest(unittest.TestCase):
++    def test_scoped_unicode_dispatch_and_unwind(self):
++        source = (ROOT / 'src/input_experiment.cpp').read_text()
++        method = re.search(r'^    void foreground_text\(.*?^    }', source, re.M | re.S)
++        self.assertIsNotNone(method)
++        fixture = r'''
++#include "unicode_text.hpp"
++#include "keyboard_layout.hpp"
++#include <algorithm>
++#include <array>
++#include <iostream>
++#include <vector>
++using namespace cua::hyprland;
++template<typename T> using SP=std::shared_ptr<T>;
++template<typename T> using WP=std::weak_ptr<T>;
++constexpr unsigned WL_KEYBOARD_KEY_STATE_PRESSED=1, WL_KEYBOARD_KEY_STATE_RELEASED=0;
++void check(bool ok,const char* why) { if(!ok) { std::cerr<<why; std::exit(1); } }
++unsigned event_ms() { return 0; }
++std::uint64_t number(std::string_view s,int base=10) { std::uint64_t n=0; const auto [p,e]=std::from_chars(s.data(),s.data()+s.size(),n,base); if(e!=std::errc{}||p!=s.data()+s.size()) throw std::runtime_error("number"); return n; }
++std::string refusal(std::string_view s) { return std::string(s); }
++constexpr auto kForegroundDelivered="acknowledged";
++struct IKeyboard { std::string map; };
++struct CWLKeyboardResource {
++    SP<IKeyboard> current;
++    xkb_state* client=nullptr;
++    std::vector<unsigned> text;
++    bool alive=true, lose_focus_on_press=false;
++    bool* focus=nullptr;
++    unsigned maps=0;
++    std::array<unsigned,4> last_modifiers{};
++    ~CWLKeyboardResource() { if(client) xkb_state_unref(client); }
++    bool good() { return alive; }
++    void sendKeymap(SP<IKeyboard> keyboard) {
++        auto* ctx=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++        auto* map=xkb_keymap_new_from_string(ctx,keyboard->map.c_str(),XKB_KEYMAP_FORMAT_TEXT_V1,XKB_KEYMAP_COMPILE_NO_FLAGS);
++        check(map,"invalid client map");
++        if(client) xkb_state_unref(client);
++        client=xkb_state_new(map); xkb_keymap_unref(map); xkb_context_unref(ctx);
++        current=keyboard; ++maps;
++    }
++    void sendMods(unsigned d,unsigned l,unsigned k,unsigned g) { last_modifiers={d,l,k,g}; xkb_state_update_mask(client,d,l,k,0,0,g); }
++    void sendKey(unsigned,unsigned code,unsigned down) {
++        if(down) { text.push_back(xkb_state_key_get_utf32(client,code+8)); if(lose_focus_on_press) *focus=false; }
++    }
++};
++struct Manager { WP<IKeyboard> m_keyboard; } manager,*g_pSeatManager=&manager;
++struct Client { bool unicode_prepared=false; std::map<std::uint32_t,SP<IKeyboard>> unicode_maps; };
++struct Guard {
++    bool focused;
++    ForegroundFailureReason dispatch_failure(bool) { return focused?ForegroundFailureReason::none:ForegroundFailureReason::keyboard_focus; }
++};
++struct Lane {
++    bool focus=true, grant=true, cancelled=false;
++    unsigned started=0,dispatches=0,completed=0;
++    std::string reply;
++    std::array<unsigned,4> ambient{};
++    xkb_keymap *physical_keymap=nullptr,*keymap=nullptr;
++    std::vector<WP<CWLKeyboardResource>> foreground_keyboards;
++    std::vector<unsigned> held_keys;
++    auto foreground_guard(Client&) { return Guard{focus}; }
++    std::array<unsigned,4> capture_foreground_modifiers(bool) { return ambient; }
++    void send(Client&,std::string result) { reply=result; }
++    bool consume_grant(Client&,std::uint64_t) { if(!grant) return false; grant=false; return true; }
++    void start_foreground(Client&,double,double,bool pointer,bool keyboard,std::array<unsigned,4>) { check(!pointer&&keyboard,"wrong route"); ++started; }
++    void require_foreground(Client&) { if(!focus||cancelled) throw ForegroundFailure{ForegroundFailureReason::keyboard_focus}; }
++    void foreground_key(Client& c,unsigned code,bool down) { require_foreground(c); for(auto& weak:foreground_keyboards) weak.lock()->sendKey(0,code,down); }
++    void complete_action() { ++completed; }
++// METHOD
++};
++int main() {
++    auto* context=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
++    auto* original_map=agent_keymap(context);
++    char* serialized=xkb_keymap_get_as_string(original_map,XKB_KEYMAP_FORMAT_TEXT_V1);
++    auto original=std::make_shared<IKeyboard>(); original->map=serialized; std::free(serialized); manager.m_keyboard=original;
++    for(int scenario=0;scenario<8;++scenario) {
++        Lane lane; lane.physical_keymap=original_map; lane.keymap=original_map;
++        auto first=std::make_shared<CWLKeyboardResource>(), second=std::make_shared<CWLKeyboardResource>();
++        first->focus=&lane.focus; second->focus=&lane.focus;
++        first->sendKeymap(original); second->sendKeymap(original);
++        lane.foreground_keyboards={first,second};
++        Client client; client.unicode_prepared=true;
++        auto glyph=std::make_shared<IKeyboard>(); glyph->map=unicode_scalar_keymap(0x6771); client.unicode_maps[0x6771]=glyph;
++        if(scenario==1) lane.focus=false;
++        if(scenario==2) client.unicode_prepared=false;
++        if(scenario==3) first->lose_focus_on_press=true;
++        if(scenario==4) lane.cancelled=true;
++        if(scenario==5) client.unicode_maps.clear();
++        if(scenario==6) lane.ambient[2]=foreground_numlock_mask(original_map);
++        if(scenario==7) client.unicode_maps.clear();
++        bool threw=false;
++        try { lane.foreground_text(client, scenario==7 ? std::vector<std::string>{"TEXT_BACKSPACE","1","token","1"} : std::vector<std::string>{"UNICODE","1","token","1","6771"},2); }
++        catch(const ForegroundFailure&) { threw=true; }
++        check(first->current==original&&second->current==original,"temporary client map stranded");
++        check(manager.m_keyboard.lock()==original,"global keyboard changed");
++        if(scenario==0 || scenario==6) {
++            check(!threw&&lane.reply==kForegroundDelivered&&lane.completed==1,"successful acknowledgment");
++            check(first->text==std::vector<unsigned>{0x6771}&&second->text==first->text,"Unicode client interpretation");
++            check(first->last_modifiers==lane.ambient && second->last_modifiers==lane.ambient,"ambient modifiers not restored");
++        } else if(scenario==7) {
++            check(!threw && lane.reply==kForegroundDelivered && first->text==std::vector<unsigned>{8},"prepared empty Backspace failed");
++        } else if(scenario==3) {
++            check(threw&&first->text.size()==1&&second->text.empty(),"focus loss dispatched to later resource");
++            check(lane.completed==0,"partial dispatch reported complete");
++        } else {
++            check(first->text.empty()&&second->text.empty(),"refusal delivered text");
++        }
++    }
++    xkb_keymap_unref(original_map); xkb_context_unref(context);
++}
++'''.replace('// METHOD', method.group())
++        compiler = shlex.split(os.environ.get('CXX', 'c++'))
++        flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', '--libs', 'xkbcommon'], text=True))
++        with tempfile.TemporaryDirectory(prefix='cua-unicode-dispatch-') as directory:
++            cpp, binary = Path(directory) / 'fixture.cpp', Path(directory) / 'fixture'
++            cpp.write_text(fixture)
++            build = subprocess.run([*compiler, '-std=c++23', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
++                                    '-I', str(ROOT / 'src'), str(cpp), '-o', str(binary), *flags],
++                                   capture_output=True, text=True, timeout=60)
++            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
++            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
++            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
++
++
++if __name__ == '__main__':
++    unittest.main()
+--- /dev/null
++++ b/tests/unicode_text_test.cpp
+@@ -0,0 +1,35 @@
++#include "unicode_text.hpp"
++#include <iostream>
++#include <algorithm>
++#include <vector>
++
++using namespace cua::hyprland;
++void check(bool ok, const char* why) { if (!ok) { std::cerr << why << '\n'; std::exit(1); } }
++template <typename F> void rejects(F f) { bool rejected=false; try { f(); } catch (...) { rejected=true; } check(rejected, "expected refusal"); }
++int main() {
++    for (auto scalar : {0x20u, 0x61u, 0xe9u, 0x6771u, 0x4eacu, 0x301u}) {
++        check(!unicode_scalar_keymap(scalar).empty(), "Unicode preflight failed");
++    }
++    for (auto scalar : {0u, 8u, 9u, 10u, 13u, 0x7fu, 0x85u, 0xd800u, 0x10000u, 0x1f98au, 0x10ffffu, 0x110000u, 0x2028u, 0x2029u})
++        rejects([&] { unicode_scalar_keymap(scalar); });
++    check(prepare_unicode_maps("-").empty(), "empty preparation");
++    check(prepare_unicode_maps("61,E9,6771,4eac,301,61").size()==5, "prepared unique scalars");
++    for (auto invalid : {"", "61,", ",61", "zz", "61,,62", "61,0", "100000000", "61,1f98a", "1f98a", "ffff,10000"})
++        rejects([&] { prepare_unicode_maps(invalid); });
++    std::string oversized;
++    for (unsigned c=0x100; c<0x181; ++c) { if (!oversized.empty()) oversized+=','; oversized+=std::format("{:x}",c); }
++    rejects([&] { prepare_unicode_maps(oversized); });
++    for (int fail_at : {-1,0,1,2,3}) {
++        std::vector<int> calls;
++        bool threw=false;
++        try {
++            with_unicode_keymaps(2,
++                [&](std::size_t i) { calls.push_back(10+i); if (fail_at==static_cast<int>(i)) throw std::runtime_error("install"); },
++                [&] { calls.push_back(20); if (fail_at==2) throw std::runtime_error("focus changed"); },
++                [&](std::size_t i) { calls.push_back(30+i); if (fail_at==3 && i==0) throw std::runtime_error("restore"); });
++        } catch (...) { threw=true; }
++        check(threw==(fail_at!=-1), "uncertain failure lost");
++        check(calls.back()==(fail_at==0 ? 30 : 31), "all modified resources must be restored");
++        if (fail_at==0 || fail_at==1) check(std::find(calls.begin(),calls.end(),20)==calls.end(), "failed prepare delivered input");
++    }
++}

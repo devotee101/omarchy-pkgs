@@ -1,0 +1,116 @@
+--- a/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs
+@@ -1314,6 +1314,26 @@
+     }
+ }
+ 
++// Only fixed diagnostic labels may leave this boundary; never expose a
++// native field value or an arbitrary transport error in an action receipt.
++fn replacement_failure_reason(error: &anyhow::Error) -> &'static str {
++    match error.to_string().as_str() {
++        "replacement_deadline" => "deadline",
++        "replacement_window_focus_lost" => "window_focus_lost",
++        "replacement_selection_or_caret_changed" => "selection_or_caret_changed",
++        "replacement_readback_differs_or_incomplete" => "readback_differs_or_incomplete",
++        "replacement_target_refused" => "target_refused",
++        "replacement_input_refused" => "input_refused",
++        "replacement_delivery_uncertain" => "delivery_uncertain",
++        "replacement_cancelled" => "cancelled",
++        "replacement_focus_lost: retained field is not focused" => "field_focus_lost",
++        "unsupported: complete replacement readback unavailable" => "native_readback_incomplete",
++        "unsupported: ambiguous replacement text offsets" => "native_offsets_ambiguous",
++        "replacement_readback_timeout" => "native_readback_timeout",
++        _ => "unclassified_failure",
++    }
++}
++
+ fn replacement_receipt(ok: bool, delivered: usize, uncertain: bool, code: &str) -> Value {
+     json!({
+         "ok":ok, "effect":if ok {"confirmed"} else if uncertain {"unverifiable"} else if delivered > 0 {"partial"} else {"refused"},
+@@ -1443,6 +1463,7 @@
+     let mut delivered = 0;
+     let mut uncertain = false;
+     let mut side_effects = false;
++    let mut stage = "transport_preflight";
+     let operation = (|| -> Result<()> {
+         replacement_live(client, deadline)?;
+         client.attest()?;
+@@ -1474,6 +1495,7 @@
+                     ),
+             "replacement_text_prepare_refused"
+         );
++        stage = "activation";
+         ensure!(
+             replacement_dispatch(client, Action::Activate, deadline, &mut uncertain)?,
+             "replacement_activation_refused"
+@@ -1481,6 +1503,7 @@
+         side_effects = true;
+         replacement_window_active(client, deadline)?;
+         uncertain = true;
++        stage = "native_focus";
+         let focused = crate::atspi::native::focus_replacement_field(
+             pid,
+             &element,
+@@ -1491,6 +1514,7 @@
+             "replacement_value_changed_before_selection"
+         );
+         replacement_window_active(client, deadline)?;
++        stage = "native_selection";
+         crate::atspi::native::select_replacement_text(
+             pid,
+             &element,
+@@ -1516,6 +1540,7 @@
+             } else {
+                 expected.as_str()
+             };
++            stage = "before_input_readback";
+             replacement_window_active(client, deadline)?;
+             let observed = crate::atspi::native::check_replacement_field(
+                 pid,
+@@ -1532,6 +1557,7 @@
+             if let Action::Unicode { scalar } = &action {
+                 next.push(*scalar);
+             }
++            stage = "input_dispatch";
+             ensure!(
+                 replacement_dispatch(client, action, deadline, &mut uncertain)?,
+                 "replacement_input_refused"
+@@ -1539,10 +1565,12 @@
+             // Count acknowledged editing packets, not inferred characters.
+             // A later readback failure still retains this delivery evidence.
+             delivered += 1;
++            stage = "after_input_readback";
+             replacement_readback(client, &element, previous, &next, deadline)?;
+             uncertain = false;
+             expected = next;
+         }
++        stage = "final_readback";
+         replacement_readback(client, &element, value, value, deadline)?;
+         Ok(())
+     })();
+@@ -1561,6 +1589,11 @@
+             "replacement_refused_or_interrupted"
+         },
+     );
++    if let Err(error) = &operation {
++        receipt["detail"] = json!(format!("{}: stage={stage}; reason={}",
++            receipt["code"].as_str().unwrap_or("replacement_not_confirmed"),
++            replacement_failure_reason(error)));
++    }
+     if operation.is_err() && side_effects && delivered == 0 {
+         receipt["effect"] = json!("unverifiable");
+     }
+@@ -3866,6 +3899,13 @@
+     }
+ 
+     #[test]
++    fn replacement_diagnostics_never_echo_arbitrary_error_content() {
++        assert_eq!(replacement_failure_reason(&anyhow::anyhow!("private field contents")), "unclassified_failure");
++        assert_eq!(replacement_failure_reason(&anyhow::anyhow!("replacement_window_focus_lost: private field contents")), "unclassified_failure");
++        assert_eq!(replacement_failure_reason(&anyhow::anyhow!("replacement_readback_differs_or_incomplete")), "readback_differs_or_incomplete");
++    }
++
++    #[test]
+     fn replacement_readback_waits_only_for_old_value_then_exact_new_value() {
+         let mut calls = 0;
+         settle_replacement_readback("old", "🦊", Instant::now() + TIMEOUT, || {

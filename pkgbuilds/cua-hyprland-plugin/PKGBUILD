@@ -4,8 +4,8 @@
 # shellcheck shell=bash disable=SC2034,SC2154
 pkgname=cua-hyprland-plugin
 pkgver=0.26.1
-pkgrel=6
-pkgdesc='Cua input candidate for reviewed profile omarchy-hypr0562r3-aq0151-remaps'
+pkgrel=6.1
+pkgdesc='Local Cua Unicode foreground input candidate; pinned Omarchy ABI profile'
 arch=('x86_64')
 url='https://github.com/trycua/cua'
 license=('MIT')
@@ -35,6 +35,16 @@ declare -gA _downstream_sha256=(
 )
 source+=('independent-keymaps.patch' 'DOWNSTREAM-PROVENANCE.json' 'downstream.py' 'downstream_test.py')
 sha256sums+=('e74d9021111a5c217b12f3e13c1bbdd260e829c60db5fc2f7293ba4846e1a7d7' 'e0c95350ec3ff2dd54a05e9377d79ddffffdb1cf494d05553a90207a3a919f7e' '7c9725805ad038737bd4d346c85f27991ce9ddfff436a32ebf515cad1bf98ca1' '7b9a992979b22a5e061fdf011ac6be59a3f1ae6e0d7c0a8ff631f74e71984c5a')
+
+# Independently pinned local layer; the original remap/profile inputs stay intact.
+declare -gA _unicode_sha256=(
+  ['unicode-text.patch']='956d254c11c8f8f3d26651a4b49c294561aec933f00ab3544c3c75579ba3868e'
+  ['UNICODE-PROVENANCE.json']='fb799693a3902467429e5deda374e446501423f6b2c553bbe298bd999c451b6e'
+  ['unicode_layer.py']='d231822c21b8116cafd27c029e7ee4d03f1c1803ecd3f1c017525cc80118de61'
+  ['unicode_layer_test.py']='80d45f19607fe1be37c512a597dddc1d08bea352174f0f475e83b98c595f588e'
+)
+source+=('unicode-text.patch' 'UNICODE-PROVENANCE.json' 'unicode_layer.py' 'unicode_layer_test.py')
+sha256sums+=('956d254c11c8f8f3d26651a4b49c294561aec933f00ab3544c3c75579ba3868e' 'fb799693a3902467429e5deda374e446501423f6b2c553bbe298bd999c451b6e' 'd231822c21b8116cafd27c029e7ee4d03f1c1803ecd3f1c017525cc80118de61' '80d45f19607fe1be37c512a597dddc1d08bea352174f0f475e83b98c595f588e')
 
 _verify_download() {
   python3 -I - "$SRCDEST/$_download_name" "$_download_sha256" "$srcdir" "$1" "$SRCDEST/PROFILE.json" <<'CUA_DOWNLOAD_PY'
@@ -158,16 +168,32 @@ _downstream() {
     --archive "$srcdir/cua-profile-kit/${_stem}.tar.gz" --cxx "$_cxx" "${@:2}"
 }
 
+_unicode() {
+  _downstream check || return 1
+  local name
+  for name in unicode-text.patch UNICODE-PROVENANCE.json unicode_layer.py unicode_layer_test.py; do
+    printf '%s  %s\n' "${_unicode_sha256[$name]}" "$SRCDEST/$name" | sha256sum -c - || return 1
+  done
+  python3 -B "$SRCDEST/unicode_layer.py" "$1" \
+    --pristine "$srcdir/$_stem" --base "$srcdir/omarchy-source" --source "$srcdir/unicode-source" \
+    --patch "$SRCDEST/unicode-text.patch" --manifest "$SRCDEST/UNICODE-PROVENANCE.json" \
+    --base-manifest "$SRCDEST/DOWNSTREAM-PROVENANCE.json" \
+    --kit "$srcdir/cua-profile-kit" --kit-sha256 "$_kit_sha256" \
+    --archive "$srcdir/cua-profile-kit/${_stem}.tar.gz" --cxx "$_cxx" "${@:2}"
+}
+
 prepare() {
   _verify_download extract || return 1
   _verify || return 1
-  _downstream prepare
+  _downstream prepare || return 1
+  _unicode prepare
 }
 
 build() {
   _verify || return 1
   _downstream check || return 1
-  cmake -S "$srcdir/omarchy-source" -B "$srcdir/build" -G Ninja \
+  _unicode check || return 1
+  cmake -S "$srcdir/unicode-source" -B "$srcdir/build" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER="$_cxx" \
     -DPKG_CONFIG_EXECUTABLE=/usr/bin/pkgconf -DPKG_CONFIG_ARGN= \
     -DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=OFF -DCMAKE_PREFIX_PATH= \
@@ -181,7 +207,9 @@ build() {
 check() {
   _verify || return 1
   _downstream check || return 1
+  _unicode check || return 1
   python3 -B "$SRCDEST/downstream_test.py" || return 1
+  python3 -B "$SRCDEST/unicode_layer_test.py" || return 1
   (
     unset LD_PRELOAD FAKEROOTKEY FAKED_MODE
     ctest --test-dir "$srcdir/build" --output-on-failure --no-tests=error
@@ -190,7 +218,7 @@ check() {
 
 package() {
   check || return 1
-  _downstream build --build "$srcdir/build" --output "$srcdir/BUILD-PROVENANCE.json" || return 1
+  _unicode build --build "$srcdir/build" --output "$srcdir/BUILD-PROVENANCE.json" || return 1
   install -Dm755 "$srcdir/build/cua-hyprland-plugin.so" \
     "$pkgdir/usr/lib/cua/hyprland/cua-hyprland-plugin.so" || return 1
   install -Dm644 "$srcdir/$_stem/LICENSE.md" \
@@ -202,7 +230,7 @@ package() {
   for name in KIT-PROVENANCE.json PROFILE.json profile_verify.py; do
     install -Dm644 "$srcdir/cua-profile-kit/$name" "$pkgdir/usr/share/$pkgname/$name" || return 1
   done
-  for name in DOWNSTREAM-PROVENANCE.json independent-keymaps.patch; do
+  for name in DOWNSTREAM-PROVENANCE.json independent-keymaps.patch UNICODE-PROVENANCE.json unicode-text.patch; do
     install -Dm644 "$SRCDEST/$name" "$pkgdir/usr/share/$pkgname/$name" || return 1
   done
 }

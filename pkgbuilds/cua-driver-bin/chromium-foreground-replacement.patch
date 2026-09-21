@@ -1,0 +1,2006 @@
+--- a/libs/cua-driver/rust/crates/cua-driver-contract/src/outputs.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-contract/src/outputs.rs
+@@ -136,8 +136,22 @@
+         Value::Object(object) => {
+             object.remove("title");
+             object.remove("description");
+-            for child in object.values_mut() {
+-                strip_schema_titles(child);
++            for (key, child) in object.iter_mut() {
++                match key.as_str() {
++                    // These are maps of user-defined names to schemas, not
++                    // schemas themselves. Preserve fields named description
++                    // or title, including native accessible descriptions.
++                    "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas" => {
++                        if let Value::Object(entries) = child {
++                            for schema in entries.values_mut() { strip_schema_titles(schema); }
++                        }
++                    }
++                    "items" | "prefixItems" | "additionalItems" | "additionalProperties"
++                    | "unevaluatedProperties" | "unevaluatedItems" | "contains"
++                    | "allOf" | "anyOf" | "oneOf" | "not" | "if" | "then" | "else"
++                    | "propertyNames" => strip_schema_titles(child),
++                    _ => {}
++                }
+             }
+         }
+         Value::Array(values) => values.iter_mut().for_each(strip_schema_titles),
+--- a/libs/cua-driver/rust/crates/cua-driver-contract/src/windows.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-contract/src/windows.rs
+@@ -198,6 +198,30 @@
+     pub h: f64,
+ }
+ 
++/// One replacement route. Null support means native or transport evidence is unavailable.
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
++pub struct TextReplacementRoute {
++    pub supported: Option<bool>,
++    pub reason: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub constraints: Option<TextReplacementConstraints>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
++pub struct TextReplacementConstraints {
++    pub max_characters: u32,
++    pub max_distinct_characters: u32,
++    pub unicode_max: u32,
++    pub control_characters: bool,
++    pub excluded_codepoints: Vec<u32>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
++pub struct TextReplacementCapabilities {
++    pub native: TextReplacementRoute,
++    pub foreground_keyboard: TextReplacementRoute,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+ pub struct WindowElement {
+     pub element_index: u64,
+@@ -211,6 +235,50 @@
+     pub value: Option<String>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub value_description: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub editable: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub editable_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub protected: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub protection_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub value_complete: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub value_status: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub value_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub accessible_name: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub name_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub name_complete: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub label_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub placeholder: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub placeholder_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub description: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub description_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub description_complete: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub input_type: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub input_type_source: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub input_type_status: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub attributes_complete: Option<bool>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub native_attributes: Option<std::collections::HashMap<String, String>>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub text_replacement: Option<TextReplacementCapabilities>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub enabled: Option<bool>,
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+@@ -318,6 +386,24 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn native_text_and_replacement_capabilities_are_advertised_in_output_schema() {
++        let schema = <super::WindowStateOutput as crate::ToolOutput>::output_schema();
++        let properties = &schema["properties"]["elements"]["items"]["properties"];
++        for name in ["editable", "protected", "value_complete", "value_status", "value_source",
++                     "accessible_name", "placeholder", "description", "input_type",
++                     "native_attributes", "text_replacement"] {
++            assert!(properties.get(name).is_some(), "missing {name} in {schema}");
++        }
++        let row = serde_json::json!({"element_index":0,"role":"combo box","depth":1,
++            "editable":true,"protected":null,"value_complete":false,"value_status":"protection_unknown",
++            "text_replacement":{"native":{"supported":null,"reason":"protection_unknown"},
++                "foreground_keyboard":{"supported":false,"reason":"protection_unknown"}}});
++        let parsed: super::WindowElement = serde_json::from_value(row).unwrap();
++        assert_eq!(parsed.protected, None);
++        assert_eq!(parsed.text_replacement.unwrap().native.supported, None);
++    }
++
+     use super::*;
+     use serde_json::json;
+ 
+--- a/libs/cua-driver/rust/crates/cua-driver/tests/protocol_schema_test.rs
++++ b/libs/cua-driver/rust/crates/cua-driver/tests/protocol_schema_test.rs
+@@ -158,7 +158,19 @@
+         })
+         .filter_map(|tool| tool["name"].as_str())
+         .collect();
+-    let expected_tools: BTreeSet<&str> = DELIVERY_MODE_TOOLS.iter().copied().collect();
++    let mut expected_tools: BTreeSet<&str> = DELIVERY_MODE_TOOLS.iter().copied().collect();
++    if cfg!(target_os = "linux") {
++        expected_tools.insert("set_value");
++        let replacement = &properties("set_value")["replacement_route"];
++        assert_eq!(replacement["default"], "native");
++        assert!(enum_contains(replacement, "native"));
++        assert!(enum_contains(replacement, "foreground_keyboard"));
++        let state = tools.iter().find(|tool| tool["name"] == "get_window_state").unwrap();
++        let rows = &state["outputSchema"]["anyOf"][0]["properties"]["elements"]["items"]["properties"];
++        for field in ["editable", "protected", "value_complete", "description", "text_replacement"] {
++            assert!(rows[field].is_object(), "missing native field schema {field}");
++        }
++    }
+     assert_eq!(
+         schema_tools, expected_tools,
+         "unexpected delivery_mode schema set"
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/mod.rs
+@@ -45,9 +45,37 @@
+     pub in_web_content: bool,
+ }
+ 
++#[derive(Clone, Debug, serde::Serialize)]
++pub struct ReplacementCapability {
++    pub supported: Option<bool>,
++    pub reason: String,
++}
++
++#[derive(Clone, Debug, serde::Serialize)]
++pub struct TextReplacementCapabilities {
++    pub native: ReplacementCapability,
++    pub foreground_keyboard: ReplacementCapability,
++}
++
++impl Default for TextReplacementCapabilities {
++    fn default() -> Self {
++        Self {
++            native: ReplacementCapability {
++                supported: None,
++                reason: "native_evidence_unavailable".into(),
++            },
++            foreground_keyboard: ReplacementCapability {
++                supported: None,
++                reason: "native_evidence_unavailable".into(),
++            },
++        }
++    }
++}
++
+ /// Native field evidence. Unknown and failed reads must not look like an empty field.
+ #[derive(Clone, Debug, serde::Serialize)]
+ pub struct NativeTextObservation {
++    pub text_replacement: TextReplacementCapabilities,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub editable: Option<bool>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+@@ -81,6 +109,7 @@
+ impl Default for NativeTextObservation {
+     fn default() -> Self {
+         Self {
++            text_replacement: Default::default(),
+             editable: None,
+             editable_source: None,
+             value_complete: false,
+--- a/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/atspi/native.rs
+@@ -1244,6 +1244,15 @@
+             name_complete,
+         )
+         .await;
++        text.text_replacement = replacement_capabilities(
++            &role,
++            state,
++            &text,
++            has_text,
++            has_editable,
++            has_component,
++            field && is_chromium_executable(pid),
++        );
+         let mut actions: Vec<String> = Vec::new();
+         if has_action || has_value || (has_text && !field && text.protected == Some(false)) {
+             if let Some(proxies) = observed_read(call(acc.proxies()).await, &mut traversal) {
+@@ -1644,6 +1653,66 @@
+         text.value_complete = text.value_status == "complete";
+     }
+     (text, value, description)
++}
++
++fn replacement_capabilities(
++    role: &str,
++    state: Option<&StateSet>,
++    text: &NativeTextObservation,
++    has_text: bool,
++    has_editable: bool,
++    has_component: bool,
++    chromium: bool,
++) -> super::TextReplacementCapabilities {
++    use super::{ReplacementCapability as Capability, TextReplacementCapabilities};
++    let cap = |supported, reason: &str| Capability {
++        supported,
++        reason: reason.into(),
++    };
++    let blocked = if text.protected == Some(true) {
++        Some((Some(false), "protected"))
++    } else if text.protected.is_none() || state.is_none() {
++        Some((None, "native_evidence_unavailable"))
++    } else if text.editable != Some(true) {
++        Some((Some(false), "not_editable"))
++    } else if !state.is_some_and(is_enabled_state) {
++        Some((Some(false), "disabled"))
++    } else if !has_text {
++        Some((Some(false), "text_interface_unavailable"))
++    } else if !text.value_complete {
++        Some((None, "complete_readback_unavailable"))
++    } else {
++        None
++    };
++    if let Some((supported, reason)) = blocked {
++        return TextReplacementCapabilities {
++            native: cap(supported, reason),
++            foreground_keyboard: cap(supported, reason),
++        };
++    }
++    let native = if has_editable {
++        cap(Some(true), "atspi.EditableText.SetTextContents")
++    } else {
++        cap(Some(false), "editable_text_interface_unavailable")
++    };
++    let foreground_keyboard = if !chromium {
++        cap(Some(false), "not_chromium")
++    } else if has_editable {
++        cap(Some(false), "native_replacement_available")
++    } else if !has_component {
++        cap(Some(false), "component_interface_unavailable")
++    } else if !matches!(
++        role.to_ascii_lowercase().as_str(),
++        "entry" | "text" | "combo box" | "combobox"
++    ) {
++        cap(Some(false), "not_ordinary_text_field")
++    } else {
++        cap(None, "requires_foreground_transport_and_focus")
++    };
++    TextReplacementCapabilities {
++        native,
++        foreground_keyboard,
++    }
+ }
+ 
+ fn observed_read<T, E>(
+@@ -3915,6 +3984,387 @@
+         }
+     }
+     best_active.or(best_passive).map(|(_, idx)| idx)
++}
++
++/// Complete ordinary-field readback from one retained snapshot object. Deliberately
++/// not Debug/Serialize: callers may compare the value, but must not log it.
++pub struct ReplacementObservation {
++    pub value: String,
++    pub character_count: i32,
++    pub focused: bool,
++    pub caret_offset: i32,
++    pub selection_count: i32,
++    pub selection: Option<(i32, i32)>,
++}
++
++fn replacement_offsets_valid(
++    count: i32,
++    caret: i32,
++    selections: i32,
++    selection: Option<(i32, i32)>,
++    focused: bool,
++    require_focus: bool,
++) -> bool {
++    // Chromium reports -1 before the field has focus. That is unknown
++    // position, not permission to type. Only read-only preflight accepts it;
++    // focused selection and every input guard require a real native offset.
++    let caret_valid = (0..=count).contains(&caret)
++        || (caret == -1 && !focused && !require_focus);
++    count >= 0 && caret_valid && (0..=1).contains(&selections)
++        && !selection.is_some_and(|(start, end)| start < 0 || end < start || end > count)
++}
++
++fn replacement_cancelled(cancelled: &AtomicBool) -> Result<()> {
++    if cancelled.load(Ordering::Acquire) {
++        Err(anyhow!("replacement_cancelled"))
++    } else {
++        Ok(())
++    }
++}
++
++fn replacement_field_guard(
++    role: &str,
++    state: &StateSet,
++    attrs: &NativeAttributes,
++    has_text: bool,
++    has_editable: bool,
++    has_component: bool,
++    require_focus: bool,
++) -> Result<()> {
++    if text_read_guard(Some(role), Some(state), Some(attrs)).is_some() {
++        return Err(anyhow!(
++            "unsupported: field protection/readability is not established"
++        ));
++    }
++    if !state.contains(State::Editable)
++        || state.contains(State::ReadOnly)
++        || !is_enabled_state(state)
++    {
++        return Err(anyhow!("unsupported: field is not enabled and editable"));
++    }
++    if !matches!(
++        role.to_ascii_lowercase().as_str(),
++        "entry" | "text" | "combo box" | "combobox"
++    ) {
++        return Err(anyhow!(
++            "unsupported: foreground replacement requires an ordinary text field"
++        ));
++    }
++    if !has_text || has_editable || !has_component {
++        return Err(anyhow!(
++            "unsupported: foreground replacement requires Text and Component without EditableText"
++        ));
++    }
++    if require_focus && !state.contains(State::Focused) {
++        return Err(anyhow!(
++            "replacement_focus_lost: retained field is not focused"
++        ));
++    }
++    Ok(())
++}
++
++async fn replacement_observe(
++    pid: u32,
++    element: &NativeElement,
++    require_focus: bool,
++    cancelled: &AtomicBool,
++) -> Result<ReplacementObservation> {
++    replacement_cancelled(cancelled)?;
++    if !is_chromium_executable(pid) {
++        return Err(anyhow!(
++            "unsupported: foreground text replacement is limited to Chromium"
++        ));
++    }
++    let target = validated_target(pid, element)
++        .await
++        .map_err(|_| anyhow!("stale_native_element: replacement target binding lost"))?;
++    let (state, role, attrs, interfaces) = tokio::join!(
++        call(target.acc.get_state()),
++        call(target.acc.get_role_name()),
++        call(target.acc.get_attributes()),
++        call(target.acc.get_interfaces()),
++    );
++    let state = state
++        .and_then(Result::ok)
++        .context("unsupported: replacement state unavailable")?;
++    let role = role
++        .and_then(Result::ok)
++        .context("unsupported: replacement role unavailable")?;
++    let attrs = attrs
++        .and_then(Result::ok)
++        .context("unsupported: replacement protection unavailable")?;
++    let interfaces = interfaces
++        .and_then(Result::ok)
++        .context("unsupported: replacement interfaces unavailable")?;
++    let input_type = ["text-input-type", "input-type"]
++        .iter()
++        .find_map(|key| attrs.get(*key).filter(|value| !value.is_empty()));
++    if role != target.role || input_type != target.text.input_type.as_ref() {
++        return Err(anyhow!(
++            "replacement_field_changed: native field type changed"
++        ));
++    }
++    replacement_field_guard(
++        &role,
++        &state,
++        &attrs,
++        interfaces.contains(Interface::Text),
++        interfaces.contains(Interface::EditableText),
++        interfaces.contains(Interface::Component),
++        require_focus,
++    )?;
++    replacement_cancelled(cancelled)?;
++    let (value, status) = read_field_value(&target.acc).await;
++    if status != "complete" {
++        return Err(anyhow!(
++            "unsupported: complete replacement readback unavailable"
++        ));
++    }
++    let value = value.context("unsupported: replacement readback missing")?;
++    let proxies = call(target.acc.proxies())
++        .await
++        .and_then(Result::ok)
++        .context("unsupported: replacement interface lookup failed")?;
++    let text = call(proxies.text())
++        .await
++        .and_then(Result::ok)
++        .context("unsupported: replacement Text unavailable")?;
++    let caret_offset = call(text.caret_offset())
++        .await
++        .and_then(Result::ok)
++        .context("unsupported: replacement caret readback unavailable")?;
++    let selection_count = call(text.get_n_selections())
++        .await
++        .and_then(Result::ok)
++        .context("unsupported: replacement selection readback unavailable")?;
++    let selection = if selection_count == 1 {
++        Some(
++            call(text.get_selection(0))
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: replacement selection bounds unavailable")?,
++        )
++    } else {
++        None
++    };
++    let character_count = value.chars().count() as i32;
++    if !replacement_offsets_valid(character_count, caret_offset, selection_count, selection,
++        state.contains(State::Focused), require_focus) {
++        return Err(anyhow!("unsupported: ambiguous replacement text offsets"));
++    }
++
++    // Re-read all mutation-relevant metadata after the text calls. A focus or
++    // protection change while reading must not authorize a subsequent key.
++    let target = validated_target(pid, element)
++        .await
++        .map_err(|_| anyhow!("stale_native_element: replacement target binding lost"))?;
++    let (state, role, attrs, interfaces) = tokio::join!(
++        call(target.acc.get_state()),
++        call(target.acc.get_role_name()),
++        call(target.acc.get_attributes()),
++        call(target.acc.get_interfaces()),
++    );
++    let state = state
++        .and_then(Result::ok)
++        .context("unsupported: replacement state unavailable")?;
++    let role = role
++        .and_then(Result::ok)
++        .context("unsupported: replacement role unavailable")?;
++    let attrs = attrs
++        .and_then(Result::ok)
++        .context("unsupported: replacement protection unavailable")?;
++    let interfaces = interfaces
++        .and_then(Result::ok)
++        .context("unsupported: replacement interfaces unavailable")?;
++    let input_type = ["text-input-type", "input-type"]
++        .iter()
++        .find_map(|key| attrs.get(*key).filter(|value| !value.is_empty()));
++    if role != target.role || input_type != target.text.input_type.as_ref() {
++        return Err(anyhow!(
++            "replacement_field_changed: native field type changed"
++        ));
++    }
++    replacement_field_guard(
++        &role,
++        &state,
++        &attrs,
++        interfaces.contains(Interface::Text),
++        interfaces.contains(Interface::EditableText),
++        interfaces.contains(Interface::Component),
++        require_focus,
++    )?;
++    replacement_cancelled(cancelled)?;
++    Ok(ReplacementObservation {
++        character_count,
++        caret_offset,
++        selection_count,
++        selection,
++        value,
++        focused: state.contains(State::Focused),
++    })
++}
++
++/// Preflight is read-only. Root tooling must separately prove the foreground
++/// compositor window and preflight every input character before changing focus.
++pub fn replacement_preflight(
++    pid: u32,
++    element: &NativeElement,
++    cancelled: &AtomicBool,
++) -> Result<ReplacementObservation> {
++    check_replacement_field(pid, element, false, cancelled)
++}
++
++/// Call before and after each delivered scalar. The compositor window proof is
++/// additional to this native retained-object/focus/protection proof.
++pub fn check_replacement_field(
++    pid: u32,
++    element: &NativeElement,
++    require_focus: bool,
++    cancelled: &AtomicBool,
++) -> Result<ReplacementObservation> {
++    bounded(
++        replacement_observe(pid, &element, require_focus, &cancelled),
++        || Err(anyhow!("replacement_readback_timeout")),
++    )
++}
++
++/// Focus exactly the retained object and independently verify Focused state.
++/// Does not activate a window; the explicit foreground route owns that step.
++pub fn focus_replacement_field(
++    pid: u32,
++    element: &NativeElement,
++    cancelled: &AtomicBool,
++) -> Result<ReplacementObservation> {
++    bounded(
++        async {
++            let before = replacement_observe(pid, &element, false, &cancelled).await?;
++            if before.focused {
++                return Ok(before);
++            }
++            let target = validated_target(pid, &element)
++                .await
++                .map_err(|_| anyhow!("stale_native_element: replacement target binding lost"))?;
++            let proxies = call(target.acc.proxies())
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: replacement interface lookup failed")?;
++            let component = call(proxies.component())
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: replacement Component unavailable")?;
++            replacement_cancelled(&cancelled)?;
++            let accepted = call(component.grab_focus())
++                .await
++                .and_then(Result::ok)
++                .context("outcome_uncertain: replacement focus acknowledgement unavailable")?;
++            if !accepted {
++                return Err(anyhow!("unsupported: replacement field refused focus"));
++            }
++            let after = replacement_observe(pid, &element, true, &cancelled).await?;
++            if after.value != before.value {
++                return Err(anyhow!(
++                    "replacement_value_changed: field changed while focusing"
++                ));
++            }
++            Ok(after)
++        },
++        || Err(anyhow!("outcome_uncertain: replacement focus timed out")),
++    )
++}
++
++fn full_selection_matches(
++    count: i32,
++    selections: i32,
++    range: Option<(i32, i32)>,
++    caret: Option<i32>,
++) -> bool {
++    if count == 0 {
++        selections == 0 && caret == Some(0)
++    } else {
++        count > 0 && selections == 1 && range == Some((0, count))
++    }
++}
++
++/// Establish a full native text selection before the foreground route sends a
++/// replacement scalar or Delete. Never uses an unbound global Select All key.
++/// An empty value is verified at caret zero without fabricating a selection.
++pub fn select_replacement_text(
++    pid: u32,
++    element: &NativeElement,
++    expected_value: &str,
++    cancelled: &AtomicBool,
++) -> Result<ReplacementObservation> {
++    bounded(
++        async {
++            let before = replacement_observe(pid, &element, true, &cancelled).await?;
++            if before.value != expected_value {
++                return Err(anyhow!(
++                    "replacement_value_changed: field changed before selection"
++                ));
++            }
++            let target = validated_target(pid, &element)
++                .await
++                .map_err(|_| anyhow!("stale_native_element: replacement target binding lost"))?;
++            let proxies = call(target.acc.proxies())
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: replacement interface lookup failed")?;
++            let text = call(proxies.text())
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: replacement Text unavailable")?;
++            let selections = call(text.get_n_selections())
++                .await
++                .and_then(Result::ok)
++                .context("unsupported: native text selection unavailable")?;
++            if !(0..=1).contains(&selections) {
++                return Err(anyhow!("unsupported: ambiguous native text selection"));
++            }
++            replacement_cancelled(&cancelled)?;
++            let acknowledged = if before.character_count == 0 {
++                if selections != 0 {
++                    return Err(anyhow!("unsupported: empty field reports a selection"));
++                }
++                call(text.set_caret_offset(0)).await.and_then(Result::ok)
++            } else if selections == 0 {
++                call(text.add_selection(0, before.character_count))
++                    .await
++                    .and_then(Result::ok)
++            } else {
++                call(text.set_selection(0, 0, before.character_count))
++                    .await
++                    .and_then(Result::ok)
++            };
++            if acknowledged != Some(true) {
++                return Err(anyhow!(
++                    "outcome_uncertain: native text selection was not acknowledged"
++                ));
++            }
++            let after = replacement_observe(pid, &element, true, &cancelled).await?;
++            if after.value != before.value {
++                return Err(anyhow!(
++                    "replacement_value_changed: field changed during selection"
++                ));
++            }
++            if !full_selection_matches(
++                after.character_count,
++                after.selection_count,
++                after.selection,
++                Some(after.caret_offset),
++            ) {
++                return Err(anyhow!(
++                    "unsupported: complete native text selection not verified"
++                ));
++            }
++            replacement_cancelled(&cancelled)?;
++            Ok(after)
++        },
++        || {
++            Err(anyhow!(
++                "outcome_uncertain: replacement selection timed out"
++            ))
++        },
++    )
+ }
+ 
+ pub fn set_value(pid: u32, element: NativeElement, value: &str) -> Result<SetValueOutcome> {
+@@ -5837,3 +6287,183 @@
+         assert!(text.input_type.is_none());
+     }
+ }
++
++#[cfg(test)]
++mod foreground_replacement_tests {
++    use super::*;
++
++    fn editable_state() -> StateSet {
++        [State::Editable, State::Enabled, State::Focused]
++            .into_iter()
++            .collect()
++    }
++
++    #[test]
++    fn full_selection_is_exact_and_unicode_offsets_are_characters() {
++        let count = "café 🦊".chars().count() as i32;
++        assert!(full_selection_matches(count, 1, Some((0, count)), None));
++        assert!(!full_selection_matches(count, 1, Some((1, count)), None));
++        assert!(!full_selection_matches(count, 2, Some((0, count)), None));
++        assert!(!full_selection_matches(count, 0, None, Some(count)));
++        assert!(full_selection_matches(0, 0, None, Some(0)));
++        assert!(!full_selection_matches(0, 1, Some((0, 0)), Some(0)));
++    }
++
++    #[test]
++    fn field_guard_rejects_protected_readonly_disabled_and_wrong_interfaces() {
++        let attrs = NativeAttributes::new();
++        let state = editable_state();
++        assert!(
++            replacement_field_guard("combo box", &state, &attrs, true, false, true, true).is_ok()
++        );
++        assert!(
++            replacement_field_guard("password text", &state, &attrs, true, false, true, true)
++                .is_err()
++        );
++        let secret = NativeAttributes::from([("text-input-type".into(), "password".into())]);
++        assert!(
++            replacement_field_guard("entry", &state, &secret, true, false, true, true).is_err()
++        );
++        let readonly = [State::Editable, State::Enabled, State::ReadOnly]
++            .into_iter()
++            .collect();
++        assert!(
++            replacement_field_guard("text", &readonly, &attrs, true, false, true, false).is_err()
++        );
++        let disabled = [State::Editable, State::Focused].into_iter().collect();
++        assert!(
++            replacement_field_guard("text", &disabled, &attrs, true, false, true, true).is_err()
++        );
++        for (text, editable, component) in [
++            (false, false, true),
++            (true, true, true),
++            (true, false, false),
++        ] {
++            assert!(replacement_field_guard(
++                "entry", &state, &attrs, text, editable, component, true
++            )
++            .is_err());
++        }
++        assert!(
++            replacement_field_guard("document web", &state, &attrs, true, false, true, true)
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn field_guard_requires_focus_and_rejects_stale_or_truncated() {
++        let attrs = NativeAttributes::new();
++        let unfocused = [State::Editable, State::Enabled].into_iter().collect();
++        assert!(
++            replacement_field_guard("text", &unfocused, &attrs, true, false, true, false).is_ok()
++        );
++        assert!(
++            replacement_field_guard("text", &unfocused, &attrs, true, false, true, true).is_err()
++        );
++        for bad in [State::Defunct, State::Stale, State::Truncated] {
++            let state = [State::Editable, State::Enabled, State::Focused, bad]
++                .into_iter()
++                .collect();
++            assert!(
++                replacement_field_guard("text", &state, &attrs, true, false, true, true).is_err()
++            );
++        }
++    }
++
++    #[test]
++    fn cancellation_precedes_connection_process_and_selection_work() {
++        let target = NativeElement::for_test("unresolvable");
++        let cancelled = AtomicBool::new(true);
++        assert_eq!(
++            replacement_preflight(0, &target, &cancelled)
++                .err()
++                .unwrap()
++                .to_string(),
++            "replacement_cancelled"
++        );
++        assert_eq!(
++            focus_replacement_field(0, &target, &cancelled)
++                .err()
++                .unwrap()
++                .to_string(),
++            "replacement_cancelled"
++        );
++        assert_eq!(
++            select_replacement_text(0, &target, "private input", &cancelled)
++                .err()
++                .unwrap()
++                .to_string(),
++            "replacement_cancelled"
++        );
++    }
++
++    #[test]
++    fn chromium_unfocused_unknown_caret_is_preflight_only() {
++        assert!(replacement_offsets_valid(0, -1, 0, None, false, false));
++        assert!(replacement_offsets_valid(5, -1, 0, None, false, false));
++        assert!(!replacement_offsets_valid(0, -1, 0, None, true, false));
++        assert!(!replacement_offsets_valid(0, -1, 0, None, false, true));
++        assert!(!replacement_offsets_valid(0, -2, 0, None, false, false));
++        assert!(!replacement_offsets_valid(0, 1, 0, None, false, false));
++        assert!(replacement_offsets_valid(0, 0, 0, None, true, true));
++        assert!(replacement_offsets_valid(5, 5, 1, Some((0, 5)), true, true));
++        assert!(!replacement_offsets_valid(5, 5, 1, Some((0, 6)), true, true));
++    }
++
++    #[test]
++    fn native_and_foreground_capabilities_distinguish_editability_from_delivery() {
++        let state = editable_state();
++        let text = NativeTextObservation {
++            editable: Some(true),
++            protected: Some(false),
++            value_complete: true,
++            ..Default::default()
++        };
++        let native = replacement_capabilities("text", Some(&state), &text, true, true, true, true);
++        assert_eq!(native.native.supported, Some(true));
++        assert_eq!(native.foreground_keyboard.supported, Some(false));
++        let chromium =
++            replacement_capabilities("combo box", Some(&state), &text, true, false, true, true);
++        assert_eq!(chromium.native.supported, Some(false));
++        assert_eq!(
++            chromium.native.reason,
++            "editable_text_interface_unavailable"
++        );
++        assert_eq!(chromium.foreground_keyboard.supported, None);
++        assert_eq!(
++            chromium.foreground_keyboard.reason,
++            "requires_foreground_transport_and_focus"
++        );
++        let other = replacement_capabilities("text", Some(&state), &text, true, false, true, false);
++        assert_eq!(other.foreground_keyboard.supported, Some(false));
++    }
++
++    #[test]
++    fn capability_unknown_and_incomplete_are_not_supported_or_safe() {
++        let state = editable_state();
++        for protected in [None, Some(true)] {
++            let text = NativeTextObservation {
++                editable: Some(true),
++                protected,
++                value_complete: true,
++                ..Default::default()
++            };
++            let caps =
++                replacement_capabilities("text", Some(&state), &text, true, true, true, true);
++            assert_ne!(caps.native.supported, Some(true));
++            assert_ne!(caps.foreground_keyboard.supported, Some(true));
++            let json = serde_json::to_value(&caps).unwrap();
++            assert!(json["native"].get("supported").is_some());
++        }
++        let incomplete = NativeTextObservation {
++            editable: Some(true),
++            protected: Some(false),
++            value_complete: false,
++            ..Default::default()
++        };
++        let caps =
++            replacement_capabilities("text", Some(&state), &incomplete, true, true, true, true);
++        assert_eq!(caps.native.supported, None);
++        assert_eq!(caps.native.reason, "complete_readback_unavailable");
++    }
++}
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+@@ -622,6 +622,21 @@
+     }
+     if let Value::Object(metadata) = serde_json::to_value(&n.text).expect("native text metadata") {
+         entry.as_object_mut().unwrap().extend(metadata);
++    }
++    // Field eligibility is native evidence; compositor availability is a
++    // separate, read-only observation. This probe never claims an input lane.
++    if n.text.text_replacement.foreground_keyboard.reason
++        == "requires_foreground_transport_and_focus"
++    {
++        let (supported, reason) = match crate::wayland::hyprland_input::foreground_replacement_capability() {
++            Some(true) => (Some(true), "requires_explicit_foreground_and_fresh_focus"),
++            Some(false) => (Some(false), "foreground_unicode_transport_unavailable"),
++            None => (None, "foreground_transport_read_failure"),
++        };
++        entry["text_replacement"]["foreground_keyboard"] =
++            json!({"supported":supported,"reason":reason,"constraints":{
++                "max_characters":4096,"max_distinct_characters":128,"unicode_max":65535,
++                "control_characters":false,"excluded_codepoints":[8232,8233]}});
+     }
+     entry["input_type_status"] = json!(if n.text.input_type.is_some() {
+         "known"
+@@ -5857,9 +5872,104 @@
+         .with_action_record(record)
+ }
+ 
++/// Native-only is deliberately the default. Permission normalization may
++/// downgrade delivery_mode; it must never leave a foreground route executable.
++fn foreground_replacement_requested(args: &Value) -> Result<bool, &'static str> {
++    match (args.get("replacement_route"), args.get("delivery_mode")) {
++        (None, None) => Ok(false),
++        (None, Some(Value::String(mode))) if mode == "background" => Ok(false),
++        (Some(Value::String(route)), mode) if route == "native" => match mode {
++            None => Ok(false),
++            Some(Value::String(mode)) if mode == "background" => Ok(false),
++            _ => Err("Native replacement requires background delivery; foreground replacement must be selected explicitly."),
++        },
++        (Some(Value::String(route)), Some(Value::String(mode)))
++            if route == "foreground_keyboard" && mode == "foreground" => Ok(true),
++        _ => Err("Foreground replacement requires replacement_route=foreground_keyboard and delivery_mode=foreground; no automatic fallback is available."),
++    }
++}
++
++fn foreground_replacement_result(result: anyhow::Result<Value>) -> ToolResult {
++    use cua_driver_core::action_record::{
++        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
++        EvidenceKind, RequestedDelivery,
++    };
++    let reply = result.unwrap_or_else(|_| json!({"ok":false,"effect":"unverifiable",
++        "code":"replacement_outcome_uncertain","detail":"Replacement worker did not establish an outcome; refresh state before another action."}));
++    let confirmed = reply["ok"] == true && reply["effect"] == "confirmed"
++        && reply["evidence"] == "native_complete_text_readback"
++        && reply["value_complete"] == true && reply["value_matches"] == true;
++    let count = reply["delivered_count"].as_u64().and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
++    let effect = if confirmed { ActionEffect::Confirmed }
++        else if reply["effect"] == "refused" && count == 0 { ActionEffect::Refused }
++        else if count > 0 { ActionEffect::Partial }
++        else { ActionEffect::Unverifiable };
++    let detail = reply["detail"].as_str().unwrap_or(
++        "Foreground replacement requires independent native readback; refresh state before another action.").to_owned();
++    let mut record = ActionExecutionRecord::builder(effect,
++        ActionTransport::LinuxHyprlandForegroundInput, RequestedDelivery::Foreground)
++        .detail(detail.clone());
++    if effect != ActionEffect::Refused {
++        record = record.actual_delivery(if confirmed {ActualDelivery::Foreground} else {ActualDelivery::Unknown})
++            .delivered_count(count);
++    }
++    if confirmed {
++        record = record.evidence(ActionEvidence {kind:EvidenceKind::ValueReadback,
++            detail:"Complete native text from the same retained window-bound field exactly matched the replacement.".into()});
++    }
++    let record = record.build().expect("foreground replacement record");
++    let mut public = serde_json::to_value(record.public_result().unwrap()).unwrap();
++    if !confirmed {
++        public["code"] = json!(reply.get("code").and_then(Value::as_str)
++            .unwrap_or("replacement_not_confirmed"));
++    }
++    (if confirmed {ToolResult::text(detail)} else {ToolResult::error(detail)})
++        .with_structured(public).with_action_record(record)
++}
++
+ #[cfg(test)]
+ mod native_value_result_tests {
+     use super::*;
++
++    #[test]
++    fn foreground_replacement_is_explicit_and_cannot_survive_permission_downgrade() {
++        assert_eq!(foreground_replacement_requested(&json!({})), Ok(false));
++        assert_eq!(foreground_replacement_requested(&json!({"replacement_route":"native","delivery_mode":"background"})), Ok(false));
++        assert_eq!(foreground_replacement_requested(&json!({"replacement_route":"foreground_keyboard","delivery_mode":"foreground"})), Ok(true));
++        for args in [
++            json!({"replacement_route":"foreground_keyboard"}),
++            json!({"replacement_route":"foreground_keyboard","delivery_mode":"background"}),
++            json!({"delivery_mode":"foreground"}),
++            json!({"replacement_route":"native","delivery_mode":"foreground"}),
++            json!({"replacement_route":null}),
++            json!({"replacement_route":"automatic"}),
++        ] { assert!(foreground_replacement_requested(&args).is_err(), "{args}"); }
++    }
++
++    #[test]
++    fn foreground_replacement_requires_complete_native_proof_and_preserves_partial_progress() {
++        let proof = json!({"ok":true,"effect":"confirmed","evidence":"native_complete_text_readback",
++            "value_complete":true,"value_matches":true,"delivered_count":3});
++        let result = foreground_replacement_result(Ok(proof.clone()));
++        let public = result.structured_content.unwrap();
++        assert_eq!(public["effect"], "confirmed");
++        let typed: cua_driver_contract::ActionResult = serde_json::from_value(public).unwrap();
++        typed.validate_invariants().unwrap();
++        for name in ["evidence", "value_complete", "value_matches"] {
++            let mut incomplete = proof.clone();
++            incomplete.as_object_mut().unwrap().remove(name);
++            let result = foreground_replacement_result(Ok(incomplete));
++            assert_eq!(result.is_error, Some(true));
++            assert_eq!(result.structured_content.unwrap()["effect"], "partial");
++        }
++        let result = foreground_replacement_result(Ok(json!({"ok":false,"effect":"refused","delivered_count":0})));
++        let public = result.structured_content.unwrap();
++        assert_eq!(public["effect"], "refused");
++        assert!(public.get("delivery").is_none_or(Value::is_null));
++        let result = foreground_replacement_result(Err(anyhow::anyhow!("untrusted error value")));
++        assert_eq!(result.structured_content.unwrap()["effect"], "unverifiable");
++        assert!(!format!("{:?}", result.content).contains("untrusted error value"));
++    }
+ 
+     #[test]
+     fn selection_only_confirms_independent_selected_readback() {
+@@ -5936,7 +6046,7 @@
+     fn def(&self) -> &ToolDef {
+         SV_DEF.get_or_init(|| ToolDef {
+             name: "set_value".into(),
+-            description: "Replace an exact snapshot-bound element's complete text through native AT-SPI EditableText, or set its numeric Value. Never appends. Unsupported replacement is refused; uncertain delivery is reported without retry. Success requires fresh complete native readback.".into(),
++            description: "Replace an exact snapshot-bound element's complete text. The default native route uses AT-SPI EditableText (or numeric Value). Chromium Text-only fields require explicit replacement_route=foreground_keyboard AND delivery_mode=foreground: activate the exact window, focus and select the retained field, deliver preflighted Unicode, and independently read back complete text. Foreground replacement leaves the target active. No automatic fallback or uncertain-delivery retry. Unsupported/protected/unknown fields refuse before input.".into(),
+             input_schema: json!({
+                 "type":"object","required":["pid","value"],"properties":{
+                     "session": cua_driver_core::tool_schema::session_schema(),
+@@ -5945,7 +6055,9 @@
+                     "element_index": cua_driver_core::tool_schema::element_index_schema(),
+                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
+                     "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
+-                    "value":{"type":"string"}
++                    "value":{"type":"string"},
++                    "replacement_route":{"type":"string","enum":["native","foreground_keyboard"],"default":"native","description":"Native-only by default. foreground_keyboard explicitly selects checked foreground Chromium replacement; requires delivery_mode=foreground and an admitted session. This route accepts at most 4096 characters and 128 distinct Unicode scalars in the BMP (through U+FFFF), excluding controls, U+2028 and U+2029. Unsupported strings refuse before selection or input; native EditableText is not restricted to BMP."},
++                    "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema_with("background (default) is native-only. foreground is allowed only with replacement_route=foreground_keyboard and visibly activates the target window; it does not restore previous focus.")
+                 },"additionalProperties":false
+             }),
+             read_only: false, destructive: true, idempotent: false, open_world: true,
+@@ -5954,6 +6066,10 @@
+ 
+     async fn invoke(&self, args: Value) -> ToolResult {
+         use cua_driver_core::tool_args::ArgsExt;
++        let foreground = match foreground_replacement_requested(&args) {
++            Ok(route) => route,
++            Err(detail) => return native_set_value_result(Err(anyhow::anyhow!(detail))),
++        };
+         let pid = match args.require_u32("pid") {
+             Ok(v) => v,
+             Err(e) => return e,
+@@ -6006,6 +6122,20 @@
+             .opt_u64("window_id")
+             .or(resolved_window_id)
+             .unwrap_or(0);
++        if foreground {
++            let owner = named_session_cursor_key(&args);
++            let (_cancellation, dispatch) = match spawn_isolated_hyprland(&args, move |cancellation| {
++                crate::wayland::hyprland_input::execute_foreground_replacement(
++                    owner, pid, xid, idx, &value_for_task, cancellation)
++            }) {
++                Ok(dispatch) => dispatch,
++                Err(refusal) => return refusal,
++            };
++            return foreground_replacement_result(match dispatch.await {
++                Ok(result) => result,
++                Err(_) => Err(anyhow::anyhow!("replacement worker unavailable")),
++            });
++        }
+         position_named_session_keyboard_cursor(
+             &self.state,
+             &args,
+--- a/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_input.rs
+@@ -237,6 +237,10 @@
+ /// here. TARGET bounds and revision remain authoritative at dispatch.
+ pub enum Action {
+     Activate,
++    Unicode {
++        scalar: char,
++    },
++    TextBackspace,
+     TextKey {
+         keycode: u32,
+         shift: bool,
+@@ -268,6 +272,7 @@
+     cancellation: ActionCancellation,
+     protocol: InputProtocol,
+     foreground_supported: bool,
++    foreground_unicode_supported: bool,
+     delivery_route: Option<DeliveryRoute>,
+     // Assigned by the compositor to this connection, never by the local pool.
+     lane: Option<usize>,
+@@ -423,6 +428,7 @@
+             cancellation,
+             protocol: protocol(),
+             foreground_supported: false,
++            foreground_unicode_supported: false,
+             delivery_route: None,
+             lane: None,
+             owner,
+@@ -461,6 +467,8 @@
+         self.epoch = hex_field(&hello, "epoch")?;
+         self.foreground_supported =
+             self.protocol == InputProtocol::Production && hello["foreground_target"] == true;
++        self.foreground_unicode_supported =
++            self.foreground_supported && replacement_hello_supported(&hello);
+         if self.protocol == InputProtocol::Experiment {
+             self.challenge = hex_field(&hello, "challenge")?;
+         } else {
+@@ -585,7 +593,11 @@
+         ensure!(self.lane.is_some(), "isolated input lane is not claimed");
+         self.check_route(route)?;
+         ensure!(
+-            route == DeliveryRoute::Foreground || !matches!(&action, Action::Activate),
++            route == DeliveryRoute::Foreground
++                || !matches!(
++                    &action,
++                    Action::Activate | Action::Unicode { .. } | Action::TextBackspace
++                ),
+             "action requires foreground input"
+         );
+         ensure!(
+@@ -763,7 +775,10 @@
+         match self {
+             Self::Activate => 16,
+             Self::Click { .. } => 1,
+-            Self::Key { .. } | Self::TextKey { .. } => 2,
++            Self::Key { .. }
++            | Self::TextKey { .. }
++            | Self::Unicode { .. }
++            | Self::TextBackspace => 2,
+             Self::Scroll { .. } => 4,
+             Self::Drag { .. } => 8,
+         }
+@@ -787,6 +802,14 @@
+         let prefix = format!("{sequence} {token} {revision}");
+         Ok(match self {
+             Self::Activate => format!("ACTIVATE {prefix}"),
++            Self::Unicode { scalar } => {
++                ensure!(
++                    replacement_scalar_supported(*scalar),
++                    "unsupported replacement scalar"
++                );
++                format!("UNICODE {prefix} {:x}", *scalar as u32)
++            }
++            Self::TextBackspace => format!("TEXT_BACKSPACE {prefix}"),
+             Self::TextKey { keycode, shift } => {
+                 ensure!((1..=57).contains(keycode), "unsupported text key");
+                 format!("KEY {prefix} {keycode} {}", u8::from(*shift))
+@@ -1105,6 +1128,544 @@
+     )
+ }
+ 
++const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(60);
++const REPLACEMENT_READBACK_SETTLE: Duration = Duration::from_millis(500);
++
++fn replacement_scalar_supported(scalar: char) -> bool {
++    // Chromium's native keyboard path truncates non-BMP characters even
++    // though XKB round-trips them. Refuse the entire string before selection;
++    // native EditableText has no such keyboard restriction.
++    u32::from(scalar) <= 0xffff
++        && !scalar.is_control() && !matches!(scalar, '\u{2028}' | '\u{2029}')
++}
++
++fn replacement_prepare_scalars(value: &str) -> Result<String> {
++    let mut unique = std::collections::BTreeSet::new();
++    let mut count = 0;
++    for scalar in value.chars() {
++        count += 1;
++        ensure!(
++            count <= 4096 && replacement_scalar_supported(scalar),
++            "unsupported_replacement_text"
++        );
++        unique.insert(scalar as u32);
++        ensure!(unique.len() <= 128, "unsupported_replacement_text");
++    }
++    Ok(if unique.is_empty() {
++        "-".into()
++    } else {
++        unique
++            .into_iter()
++            .map(|scalar| format!("{scalar:x}"))
++            .collect::<Vec<_>>()
++            .join(",")
++    })
++}
++
++fn replacement_live(client: &Client, deadline: Instant) -> Result<()> {
++    client.cancellation.check()?;
++    ensure!(Instant::now() < deadline, "replacement_deadline");
++    ensure!(
++        !cua_driver_core::session::is_session_ending(&client.owner),
++        "replacement_session_ending"
++    );
++    Ok(())
++}
++
++fn replacement_request(client: &Client, packet: &str, deadline: Instant) -> Result<Value> {
++    replacement_live(client, deadline)?;
++    let deadline = deadline.min(Instant::now() + TIMEOUT);
++    client.send_packet(packet, deadline)?;
++    client.receive(deadline)
++}
++
++fn replacement_target(client: &Client, action: &Action, deadline: Instant) -> Result<Value> {
++    client.check_route(DeliveryRoute::Foreground)?;
++    ensure!(
++        client.foreground_unicode_supported,
++        "foreground_replacement_unavailable"
++    );
++    let target = replacement_request(
++        client,
++        &client.target_packet_routed(action, DeliveryRoute::Foreground),
++        deadline,
++    )?;
++    ensure!(target["ok"] == true, "replacement_target_refused");
++    validate_target_route(&target, DeliveryRoute::Foreground)?;
++    Ok(target)
++}
++
++/// This path deliberately has no stale-geometry retry. Each packet is sent at
++/// most once; only independent observations may be repeated.
++fn replacement_dispatch(
++    client: &mut Client,
++    action: Action,
++    deadline: Instant,
++    uncertain: &mut bool,
++) -> Result<bool> {
++    replacement_live(client, deadline)?;
++    let target = replacement_target(client, &action, deadline)?;
++    let token = hex_field(&target, "target")?;
++    let revision = target["revision"]
++        .as_u64()
++        .context("replacement_revision_unavailable")?;
++    let width = target["width"]
++        .as_f64()
++        .context("replacement_geometry_unavailable")?;
++    let height = target["height"]
++        .as_f64()
++        .context("replacement_geometry_unavailable")?;
++    client.sequence = client
++        .sequence
++        .checked_add(1)
++        .context("replacement_sequence_exhausted")?;
++    let packet = action.packet(client.sequence, &token, revision, width, height)?;
++    replacement_live(client, deadline)?;
++    // An error after this point cannot prove that the compositor did not see
++    // the packet. Never retry or substitute a different route.
++    *uncertain = true;
++    let reply = replacement_request(client, &packet, deadline)?;
++    if reply["ok"] == false {
++        if reply["code"] == "foreground_partial_unknown" {
++            bail!("replacement_delivery_uncertain");
++        }
++        *uncertain = false;
++        return Ok(false);
++    }
++    ensure!(
++        reply["effect"] == "unverifiable" && reply["route"] == "primary_foreground",
++        "replacement_acknowledgement_invalid"
++    );
++    Ok(true)
++}
++
++fn replacement_position_matches(
++    observation: &crate::atspi::native::ReplacementObservation,
++    expected: &str,
++    initial: bool,
++) -> bool {
++    if !observation.focused
++        || observation.value != expected
++        || observation.character_count != expected.chars().count() as i32
++    {
++        return false;
++    }
++    if initial && !expected.is_empty() {
++        observation.selection_count == 1
++            && observation.selection == Some((0, observation.character_count))
++    } else {
++        observation.selection_count == 0
++            && observation.selection.is_none()
++            && observation.caret_offset == observation.character_count
++    }
++}
++
++fn replacement_window_active(client: &Client, deadline: Instant) -> Result<()> {
++    replacement_live(client, deadline)?;
++    ensure!(
++        super::hyprland::target_is_active(client.address, Some(client.pid))?,
++        "replacement_window_focus_lost"
++    );
++    replacement_live(client, deadline)
++}
++
++/// Wait only for an acknowledged key to appear in native readback. Old text
++/// may survive briefly while Chromium processes the event. Any different text,
++/// focus/protection loss, or stale object ends the operation without replay.
++fn replacement_readback(
++    client: &Client,
++    element: &crate::atspi::NativeElement,
++    previous: &str,
++    expected: &str,
++    deadline: Instant,
++) -> Result<()> {
++    settle_replacement_readback(previous, expected, deadline, || {
++        replacement_window_active(client, deadline)?;
++        let observation = crate::atspi::native::check_replacement_field(
++            client.pid,
++            element,
++            true,
++            client.cancellation.0.as_ref(),
++        )?;
++        replacement_window_active(client, deadline)?;
++        Ok(observation)
++    })
++}
++
++fn settle_replacement_readback(
++    previous: &str,
++    expected: &str,
++    deadline: Instant,
++    mut observe: impl FnMut() -> Result<crate::atspi::native::ReplacementObservation>,
++) -> Result<()> {
++    let settle = deadline.min(Instant::now() + REPLACEMENT_READBACK_SETTLE);
++    loop {
++        ensure!(Instant::now() < deadline, "replacement_deadline");
++        let observation = observe()?;
++        ensure!(Instant::now() < deadline, "replacement_deadline");
++        if replacement_position_matches(&observation, expected, false) {
++            return Ok(());
++        }
++        ensure!(
++            observation.focused && observation.value == previous && Instant::now() < settle,
++            "replacement_readback_differs_or_incomplete"
++        );
++        std::thread::sleep(Duration::from_millis(10));
++    }
++}
++
++fn replacement_receipt(ok: bool, delivered: usize, uncertain: bool, code: &str) -> Value {
++    json!({
++        "ok":ok, "effect":if ok {"confirmed"} else if uncertain {"unverifiable"} else if delivered > 0 {"partial"} else {"refused"},
++        "code":code,"detail":code,"route":"primary_foreground","replacement_route":"foreground_keyboard",
++        "value_complete":ok,"value_matches":ok,
++        "evidence":if ok {"native_complete_text_readback"} else {"none"},
++        "delivery":{"mode":"foreground","delivered_count":delivered},
++        "delivered_count":delivered,
++    })
++}
++
++/// Explicit foreground replacement, admitted by the common tool registry.
++/// The per-session input mutex is held through every native observation and
++/// compositor packet, so another call on this session cannot interleave keys.
++pub(crate) fn execute_foreground_replacement(
++    owner: Option<String>,
++    pid: u32,
++    address: u64,
++    element: crate::atspi::NativeElement,
++    value: &str,
++    cancellation: ActionCancellation,
++) -> Result<Value> {
++    // Every error propagated by the inner function precedes activation or
++    // editing. Once any side effect can begin, it returns a classified receipt.
++    Ok(
++        execute_foreground_replacement_inner(owner, pid, address, element, value, cancellation)
++            .unwrap_or_else(|_| {
++                replacement_receipt(
++                    false,
++                    0,
++                    false,
++                    "replacement_preflight_or_transport_refused",
++                )
++            }),
++    )
++}
++
++fn execute_foreground_replacement_inner(
++    owner: Option<String>,
++    pid: u32,
++    address: u64,
++    element: crate::atspi::NativeElement,
++    value: &str,
++    cancellation: ActionCancellation,
++) -> Result<Value> {
++    let deadline = Instant::now() + REPLACEMENT_TIMEOUT;
++    let prepared = match replacement_prepare_scalars(value) {
++        Ok(prepared) => prepared,
++        Err(_) => {
++            return Ok(replacement_receipt(
++                false,
++                0,
++                false,
++                "unsupported_replacement_text",
++            ))
++        }
++    };
++    cancellation.check()?;
++    ensure!(
++        enabled() && protocol() == InputProtocol::Production,
++        "foreground replacement transport unavailable"
++    );
++    ensure!(
++        pid > 0 && address > 0 && element.window_id() == address,
++        "exact replacement target required"
++    );
++    let owner = owner.context("authenticated lifecycle required")?;
++    let pooled = session_client(&owner)?;
++    // Bound lock acquisition as well as the transaction. The ordinary helper
++    // intentionally waits for lifecycle cancellation; replacement additionally
++    // has one overall deadline.
++    let mut slot = loop {
++        cancellation.check()?;
++        ensure!(Instant::now() < deadline, "replacement_deadline");
++        match pooled.client.try_lock() {
++            Ok(slot) => break slot,
++            Err(TryLockError::WouldBlock) => std::thread::sleep(CANCELLATION_POLL),
++            Err(TryLockError::Poisoned(_)) => bail!("input connection poisoned"),
++        }
++    };
++    let initial =
++        match crate::atspi::native::replacement_preflight(pid, &element, cancellation.0.as_ref()) {
++            Ok(observation) => observation,
++            Err(error) => {
++                let mut receipt = replacement_receipt(
++                    false,
++                    0,
++                    false,
++                    "native_replacement_preflight_refused",
++                );
++                // The replacement helper deliberately maps D-Bus failures to
++                // static diagnostics and never formats native field content.
++                receipt["detail"] = json!(error.to_string());
++                return Ok(receipt);
++            }
++        };
++    cancellation.check()?;
++    ensure!(Instant::now() < deadline, "replacement_deadline");
++    if slot.as_ref().is_some_and(|client| {
++        client.peer_closed()
++            || client.pid != pid
++            || client.address != address
++            || client.protocol != InputProtocol::Production
++            || client
++                .delivery_route
++                .is_some_and(|route| route != DeliveryRoute::Foreground)
++            || client.lane.and_then(|lane| socket_path(lane).ok()).as_ref() != Some(&client.path)
++    }) {
++        *slot = None;
++    }
++    if slot.is_none() {
++        *slot = Some(claim_available(|lane| {
++            Client::connect(
++                socket_path(lane)?,
++                owner.clone(),
++                pid,
++                address,
++                lane,
++                cancellation.clone(),
++            )
++        })?);
++    }
++    let client = slot
++        .as_mut()
++        .context("missing replacement input connection")?;
++    client.cancellation = cancellation;
++    let mut delivered = 0;
++    let mut uncertain = false;
++    let mut side_effects = false;
++    let operation = (|| -> Result<()> {
++        replacement_live(client, deadline)?;
++        client.attest()?;
++        ensure!(
++            client.foreground_unicode_supported,
++            "foreground_replacement_unavailable"
++        );
++        client.delivery_route = Some(DeliveryRoute::Foreground);
++        // This operation preflights every Unicode scalar without input or
++        // focus changes. A missing plugin/layout capability refuses here.
++        let target = replacement_target(client, &Action::TextBackspace, deadline)?;
++        let token = hex_field(&target, "target")?;
++        let revision = target["revision"]
++            .as_u64()
++            .context("replacement_revision_unavailable")?;
++        let reply = replacement_request(
++            client,
++            &format!("TEXT_PREPARE {token} {revision} {prepared}"),
++            deadline,
++        )?;
++        ensure!(
++            reply["ok"] == true
++                && reply["prepared_count"].as_u64()
++                    == Some(
++                        value
++                            .chars()
++                            .collect::<std::collections::BTreeSet<_>>()
++                            .len() as u64
++                    ),
++            "replacement_text_prepare_refused"
++        );
++        ensure!(
++            replacement_dispatch(client, Action::Activate, deadline, &mut uncertain)?,
++            "replacement_activation_refused"
++        );
++        side_effects = true;
++        replacement_window_active(client, deadline)?;
++        uncertain = true;
++        let focused = crate::atspi::native::focus_replacement_field(
++            pid,
++            &element,
++            client.cancellation.0.as_ref(),
++        )?;
++        ensure!(
++            focused.value == initial.value,
++            "replacement_value_changed_before_selection"
++        );
++        replacement_window_active(client, deadline)?;
++        crate::atspi::native::select_replacement_text(
++            pid,
++            &element,
++            &initial.value,
++            client.cancellation.0.as_ref(),
++        )?;
++        let mut expected = String::new();
++        let actions: Vec<Action> = if value.is_empty() {
++            if initial.value.is_empty() {
++                Vec::new()
++            } else {
++                vec![Action::TextBackspace]
++            }
++        } else {
++            value
++                .chars()
++                .map(|scalar| Action::Unicode { scalar })
++                .collect()
++        };
++        for (index, action) in actions.into_iter().enumerate() {
++            let previous = if index == 0 {
++                initial.value.as_str()
++            } else {
++                expected.as_str()
++            };
++            replacement_window_active(client, deadline)?;
++            let observed = crate::atspi::native::check_replacement_field(
++                pid,
++                &element,
++                true,
++                client.cancellation.0.as_ref(),
++            )?;
++            ensure!(
++                replacement_position_matches(&observed, previous, index == 0),
++                "replacement_selection_or_caret_changed"
++            );
++            replacement_window_active(client, deadline)?;
++            let mut next = expected.clone();
++            if let Action::Unicode { scalar } = &action {
++                next.push(*scalar);
++            }
++            ensure!(
++                replacement_dispatch(client, action, deadline, &mut uncertain)?,
++                "replacement_input_refused"
++            );
++            // Count acknowledged editing packets, not inferred characters.
++            // A later readback failure still retains this delivery evidence.
++            delivered += 1;
++            replacement_readback(client, &element, previous, &next, deadline)?;
++            uncertain = false;
++            expected = next;
++        }
++        replacement_readback(client, &element, value, value, deadline)?;
++        Ok(())
++    })();
++    // A fresh plan is mandatory for every invocation. Closing the connection
++    // revokes it on all exits, including cancellation and partial delivery.
++    *slot = None;
++    let mut receipt = replacement_receipt(
++        operation.is_ok(),
++        delivered,
++        uncertain,
++        if operation.is_ok() {
++            "replacement_verified"
++        } else if uncertain {
++            "replacement_delivery_or_readback_uncertain"
++        } else {
++            "replacement_refused_or_interrupted"
++        },
++    );
++    if operation.is_err() && side_effects && delivered == 0 {
++        receipt["effect"] = json!("unverifiable");
++    }
++    Ok(receipt)
++}
++
++#[derive(Default)]
++struct ReplacementCapabilityCache {
++    path: Option<PathBuf>,
++    checked: Option<Instant>,
++    inflight: bool,
++    value: Option<bool>,
++}
++static REPLACEMENT_CAPABILITY: OnceLock<Mutex<ReplacementCapabilityCache>> = OnceLock::new();
++
++fn probe_replacement_capability(path: PathBuf) -> Option<bool> {
++    let deadline = Instant::now() + Duration::from_millis(100);
++    let socket = socket2::Socket::new(
++        socket2::Domain::UNIX,
++        socket2::Type::from(libc::SOCK_SEQPACKET),
++        None,
++    )
++    .ok()?;
++    socket
++        .connect_timeout(
++            &socket2::SockAddr::unix(&path).ok()?,
++            Duration::from_millis(100),
++        )
++        .ok()?;
++    socket.set_nonblocking(true).ok()?;
++    let client = Client {
++        socket,
++        cancellation: ActionCancellation::default(),
++        protocol: InputProtocol::Production,
++        foreground_supported: false,
++        foreground_unicode_supported: false,
++        delivery_route: None,
++        lane: None,
++        owner: "replacement-capability-readonly".into(),
++        path,
++        pid: 0,
++        address: 0,
++        epoch: String::new(),
++        challenge: String::new(),
++        sequence: 0,
++    };
++    client.attest().ok()?;
++    replacement_hello_capability(&client, deadline)
++}
++
++fn replacement_hello_capability(client: &Client, deadline: Instant) -> Option<bool> {
++    // HELLO is discovery only: do not CLAIM a lane, TARGET a window or dispatch.
++    client.send_packet("HELLO", deadline).ok()?;
++    let hello = client.receive(deadline).ok()?;
++    if hello["ok"] != true || hello["protocol"] != 3 {
++        return None;
++    }
++    Some(replacement_hello_supported(&hello))
++}
++
++fn replacement_hello_supported(hello: &Value) -> bool {
++    hello["foreground_target"] == true && hello["foreground_unicode_scalar"] == true
++        && hello["foreground_unicode_max"].as_u64().is_some_and(|max| max >= 0xffff)
++}
++
++/// Best-effort read-only transport evidence. The first call waits at most
++/// 100ms; subsequent captures share a one-second cache and never reserve lanes.
++pub(crate) fn foreground_replacement_capability() -> Option<bool> {
++    if protocol() != InputProtocol::Production || !enabled() {
++        return Some(false);
++    }
++    let path = socket_path(0).ok()?;
++    let cache = REPLACEMENT_CAPABILITY.get_or_init(Default::default);
++    let mut state = cache.lock().ok()?;
++    if state.path.as_ref() == Some(&path) {
++        if state.inflight
++            || state
++                .checked
++                .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
++        {
++            return state.value;
++        }
++    } else if state.inflight {
++        return None;
++    }
++    state.path = Some(path.clone());
++    state.inflight = true;
++    state.value = None;
++    drop(state);
++    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++    std::thread::spawn(move || {
++        let value = probe_replacement_capability(path);
++        if let Ok(mut state) = REPLACEMENT_CAPABILITY.get().unwrap().lock() {
++            state.value = value;
++            state.checked = Some(Instant::now());
++            state.inflight = false;
++        }
++        let _ = sender.send(value);
++    });
++    receiver
++        .recv_timeout(Duration::from_millis(100))
++        .ok()
++        .flatten()
++}
++
+ fn execute_actions_routed(
+     owner: Option<String>,
+     pid: u32,
+@@ -2464,6 +3025,7 @@
+                 cancellation: ActionCancellation::default(),
+                 protocol: InputProtocol::Experiment,
+                 foreground_supported: false,
++                foreground_unicode_supported: false,
+                 delivery_route: None,
+                 lane: None,
+                 owner: "input-unregistered-test-client".into(),
+@@ -3223,4 +3785,328 @@
+             .contains("oversized"));
+         server.join().unwrap();
+     }
+-}
++    fn replacement_observation(value: &str) -> crate::atspi::native::ReplacementObservation {
++        crate::atspi::native::ReplacementObservation {
++            value: value.into(),
++            character_count: value.chars().count() as i32,
++            focused: true,
++            caret_offset: value.chars().count() as i32,
++            selection_count: 0,
++            selection: None,
++        }
++    }
++
++    #[test]
++    fn replacement_preflight_validates_every_scalar_before_delivery() {
++        assert!(replacement_hello_supported(&json!({"foreground_target":true,
++            "foreground_unicode_scalar":true,"foreground_unicode_max":65535})));
++        assert!(!replacement_hello_supported(&json!({"foreground_target":true,
++            "foreground_unicode_scalar":true})));
++        assert!(!replacement_hello_supported(&json!({"foreground_target":true,
++            "foreground_unicode_scalar":true,"foreground_unicode_max":127})));
++        assert_eq!(
++            replacement_prepare_scalars("café 東京 café").unwrap(),
++            "20,61,63,66,e9,4eac,6771"
++        );
++        assert_eq!(replacement_prepare_scalars("").unwrap(), "-");
++        for bad in [
++            "ok\n",
++            "ok\t",
++            "ok\0",
++            "ok\u{7f}",
++            "ok\u{85}",
++            "ok\u{2028}",
++            "ok\u{2029}",
++            "ok🦊",
++            "ok\u{10000}",
++            "ok\u{10ffff}",
++        ] {
++            assert!(replacement_prepare_scalars(bad).is_err());
++        }
++        assert!(replacement_prepare_scalars(&"東".repeat(4096)).is_ok());
++        assert!(replacement_prepare_scalars(&"東".repeat(4097)).is_err());
++        let distinct: String = (0x400..0x481).filter_map(char::from_u32).collect();
++        assert!(replacement_prepare_scalars(&distinct).is_err());
++    }
++
++    #[test]
++    fn replacement_guard_rejects_wrong_focus_caret_selection_and_text() {
++        let mut observation = replacement_observation("café 🦊");
++        assert!(replacement_position_matches(&observation, "café 🦊", false));
++        assert!(!replacement_position_matches(&observation, "café 🦊", true));
++        observation.selection_count = 1;
++        observation.selection = Some((0, 6));
++        assert!(replacement_position_matches(&observation, "café 🦊", true));
++        observation.selection = Some((1, 6));
++        assert!(!replacement_position_matches(&observation, "café 🦊", true));
++        observation = replacement_observation("café 🦊");
++        observation.caret_offset = 1;
++        assert!(!replacement_position_matches(
++            &observation,
++            "café 🦊",
++            false
++        ));
++        observation = replacement_observation("café 🦊");
++        observation.focused = false;
++        assert!(!replacement_position_matches(
++            &observation,
++            "café 🦊",
++            false
++        ));
++        assert!(!replacement_position_matches(
++            &replacement_observation("wrong"),
++            "expected",
++            false
++        ));
++        assert!(replacement_position_matches(
++            &replacement_observation(""),
++            "",
++            true
++        ));
++    }
++
++    #[test]
++    fn replacement_readback_waits_only_for_old_value_then_exact_new_value() {
++        let mut calls = 0;
++        settle_replacement_readback("old", "🦊", Instant::now() + TIMEOUT, || {
++            calls += 1;
++            Ok(replacement_observation(if calls == 1 {
++                "old"
++            } else {
++                "🦊"
++            }))
++        })
++        .unwrap();
++        assert_eq!(calls, 2);
++        for changed in ["wrong", "old"] {
++            let mut calls = 0;
++            let result =
++                settle_replacement_readback("old", "new", Instant::now() + TIMEOUT, || {
++                    calls += 1;
++                    let mut observation = replacement_observation(changed);
++                    observation.focused = changed != "old";
++                    Ok(observation)
++                });
++            assert!(result.is_err());
++            assert_eq!(calls, 1);
++        }
++        assert!(
++            settle_replacement_readback("old", "new", Instant::now(), || panic!(
++                "expired read must not run"
++            ))
++            .is_err()
++        );
++        let mut calls = 0;
++        assert!(
++            settle_replacement_readback("old", "new", Instant::now() + TIMEOUT, || {
++                calls += 1;
++                Err(ActionCancelled.into())
++            })
++            .is_err()
++        );
++        assert_eq!(calls, 1);
++    }
++
++    #[test]
++    fn replacement_receipts_never_upgrade_partial_or_uncertain_to_success() {
++        assert_eq!(
++            replacement_receipt(false, 0, false, "refused")["effect"],
++            "refused"
++        );
++        assert_eq!(
++            replacement_receipt(false, 2, false, "stopped")["effect"],
++            "partial"
++        );
++        assert_eq!(
++            replacement_receipt(false, 2, true, "unknown")["effect"],
++            "unverifiable"
++        );
++        let verified = replacement_receipt(true, 2, false, "verified");
++        assert_eq!(verified["evidence"], "native_complete_text_readback");
++        assert_eq!(verified["value_complete"], true);
++        assert_eq!(verified["value_matches"], true);
++        assert!(verified.get("value").is_none());
++    }
++
++    #[test]
++    fn replacement_packets_require_foreground_and_key_capability() {
++        assert_eq!(Action::Unicode { scalar: '東' }.capability(), 2);
++        assert_eq!(Action::TextBackspace.capability(), 2);
++        assert_eq!(
++            Action::Unicode { scalar: '東' }
++                .packet(4, TOKEN, 7, 10.0, 10.0)
++                .unwrap(),
++            format!("UNICODE 4 {TOKEN} 7 6771")
++        );
++        assert_eq!(
++            Action::TextBackspace
++                .packet(5, TOKEN, 7, 10.0, 10.0)
++                .unwrap(),
++            format!("TEXT_BACKSPACE 5 {TOKEN} 7")
++        );
++        for action in [Action::Unicode { scalar: 'a' }, Action::TextBackspace] {
++            let (mut client, _peer) = production_test_client();
++            assert!(client
++                .execute_routed_with_attest(
++                    action,
++                    None,
++                    DeliveryRoute::Background,
++                    record_test_attestation
++                )
++                .is_err());
++        }
++    }
++
++    #[test]
++    fn replacement_unicode_stale_geometry_is_not_replayed() {
++        let (mut client, peer) = production_test_client();
++        client.foreground_unicode_supported = true;
++        let server = std::thread::spawn(move || {
++            assert_eq!(read_packet(&peer), "FOREGROUND_TARGET 1 1 2");
++            peer.send(json!({"ok":true,"route":"primary_foreground","target":TOKEN,"revision":7,"width":100,"height":100}).to_string().as_bytes()).unwrap();
++            assert_eq!(read_packet(&peer), format!("UNICODE 1 {TOKEN} 7 6771"));
++            peer.send(br#"{"ok":false,"code":"stale_geometry","detail":"stale_geometry"}"#)
++                .unwrap();
++            peer
++        });
++        let mut uncertain = false;
++        assert!(!replacement_dispatch(
++            &mut client,
++            Action::Unicode { scalar: '東' },
++            Instant::now() + TIMEOUT,
++            &mut uncertain
++        )
++        .unwrap());
++        assert!(!uncertain);
++        let peer = server.join().unwrap();
++        peer.set_nonblocking(true).unwrap();
++        let mut byte = 0u8;
++        assert_eq!(
++            unsafe {
++                libc::recv(
++                    peer.as_raw_fd(),
++                    (&mut byte as *mut u8).cast(),
++                    1,
++                    libc::MSG_DONTWAIT,
++                )
++            },
++            -1
++        );
++    }
++
++    #[test]
++    fn replacement_unknown_dispatch_is_never_replayed_and_cancellation_sends_nothing() {
++        let (mut client, peer) = production_test_client();
++        client.foreground_unicode_supported = true;
++        let server = std::thread::spawn(move || {
++            assert_eq!(read_packet(&peer), "FOREGROUND_TARGET 1 1 2");
++            peer.send(json!({"ok":true,"route":"primary_foreground","target":TOKEN,"revision":7,"width":100,"height":100}).to_string().as_bytes()).unwrap();
++            assert_eq!(read_packet(&peer), format!("TEXT_BACKSPACE 1 {TOKEN} 7"));
++            // Drop without an acknowledgement after the edit packet.
++        });
++        let mut uncertain = false;
++        assert!(replacement_dispatch(
++            &mut client,
++            Action::TextBackspace,
++            Instant::now() + TIMEOUT,
++            &mut uncertain
++        )
++        .is_err());
++        assert!(uncertain);
++        server.join().unwrap();
++        let (mut client, peer) = production_test_client();
++        client.foreground_unicode_supported = true;
++        client.cancellation.0.store(true, Ordering::Release);
++        let mut uncertain = false;
++        assert!(replacement_dispatch(
++            &mut client,
++            Action::TextBackspace,
++            Instant::now() + TIMEOUT,
++            &mut uncertain
++        )
++        .is_err());
++        assert!(!uncertain);
++        peer.set_nonblocking(true).unwrap();
++        let mut byte = 0u8;
++        assert_eq!(
++            unsafe {
++                libc::recv(
++                    peer.as_raw_fd(),
++                    (&mut byte as *mut u8).cast(),
++                    1,
++                    libc::MSG_DONTWAIT,
++                )
++            },
++            -1
++        );
++    }
++
++    #[test]
++    fn replacement_capability_probe_only_sends_hello_and_old_plugin_is_false() {
++        for advertised in [false, true] {
++            let (client, peer) = production_test_client();
++            let server = std::thread::spawn(move || {
++                assert_eq!(read_packet(&peer), "HELLO");
++                peer.send(json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true,"foreground_unicode_scalar":advertised,"foreground_unicode_max":65535}).to_string().as_bytes()).unwrap();
++                peer
++            });
++            assert_eq!(
++                replacement_hello_capability(&client, Instant::now() + TIMEOUT),
++                Some(advertised)
++            );
++            let peer = server.join().unwrap();
++            peer.set_nonblocking(true).unwrap();
++            let mut byte = 0u8;
++            assert_eq!(
++                unsafe {
++                    libc::recv(
++                        peer.as_raw_fd(),
++                        (&mut byte as *mut u8).cast(),
++                        1,
++                        libc::MSG_DONTWAIT,
++                    )
++                },
++                -1
++            );
++        }
++    }
++    #[test]
++    fn replacement_activation_loss_partial_ack_and_postactivation_failure_are_unknown() {
++        for reply in [
++            None,
++            Some(
++                json!({"ok":false,"code":"foreground_partial_unknown","detail":"foreground_partial_unknown"}),
++            ),
++            Some(json!({"ok":true,"effect":"unverifiable","route":"primary_foreground"})),
++        ] {
++            let (mut client, peer) = production_test_client();
++            client.foreground_unicode_supported = true;
++            let acknowledgement_expected = reply.as_ref().is_some_and(|reply| reply["ok"] == true);
++            let server = std::thread::spawn(move || {
++                assert_eq!(read_packet(&peer), "FOREGROUND_TARGET 1 1 16");
++                peer.send(json!({"ok":true,"route":"primary_foreground","target":TOKEN,"revision":7,"width":100,"height":100}).to_string().as_bytes()).unwrap();
++                assert_eq!(read_packet(&peer), format!("ACTIVATE 1 {TOKEN} 7"));
++                if let Some(reply) = reply {
++                    peer.send(reply.to_string().as_bytes()).unwrap();
++                }
++            });
++            let mut uncertain = false;
++            let dispatched = replacement_dispatch(
++                &mut client,
++                Action::Activate,
++                Instant::now() + TIMEOUT,
++                &mut uncertain,
++            );
++            assert_eq!(dispatched.is_ok(), acknowledgement_expected);
++            assert!(uncertain);
++            // Simulate failure of the independent active-window/native-focus
++            // read that follows the successful acknowledgement.
++            assert_eq!(
++                replacement_receipt(false, 0, uncertain, "postactivation_readback_failed")
++                    ["effect"],
++                "unverifiable"
++            );
++            server.join().unwrap();
++        }
++    }
++}
