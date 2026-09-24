@@ -14,4 +14,3 @@ transcribe-cpp = { version = "=0.2.3", default-features = false, features = ["vu
 
 [profile.release]
 debug = 0
-
