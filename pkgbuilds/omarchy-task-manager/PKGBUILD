@@ -1,8 +1,8 @@
 # Canonical recipe. scripts/package-source.sh fills the release source checksum.
 # Maintainer: Tom Ballard (tcballard)
 pkgname=omarchy-task-manager
-pkgver=0.0.3
-pkgrel=3
+pkgver=0.1.0
+pkgrel=1
 url='https://github.com/tcballard/omarchy-task-manager'
 pkgdesc='Floating native task manager for Omarchy (preview)'
 arch=('x86_64')
@@ -14,9 +14,7 @@ checkdepends=('python' 'desktop-file-utils')
 source=("$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz"
         "pause-resume-test.patch"
         "worker-shutdown.patch")
-sha256sums=('cc3e24a0bb8fad2b7ce0d4fb780aa774d32b53b8de924b488b55674bdb936c85'
-            'ce191fc8dc7e4f7018193aa4982d58fd463f66b37e3129b3acce46b7a1c9a89e'
-            '1142aaedf8739bf2ed1cb823a03ed7e406d7ff59d7dfb72748815cc81cfda96b')
+sha256sums=('4a125866f78536c366d021663cc609d1f1ae7c0df95aa7c0b189c330f4041269' 'ce191fc8dc7e4f7018193aa4982d58fd463f66b37e3129b3acce46b7a1c9a89e' '1142aaedf8739bf2ed1cb823a03ed7e406d7ff59d7dfb72748815cc81cfda96b')
 
 # Backport upstream PR #11 (sample observation) and PR #12 (worker shutdown).
 prepare() {
